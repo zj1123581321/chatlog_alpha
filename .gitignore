@@ -37,5 +37,5 @@ tmpclaude-*/
 sns.md
 .claude/settings.local.json
 
-# Local startup script (contains keys/paths)
-start_server.bat
+# Local env config (contains keys/paths)
+.env.bat
