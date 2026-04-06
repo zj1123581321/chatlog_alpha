@@ -10,31 +10,13 @@
 | GCC (MinGW-w64) | - | CGO 编译 `go-sqlite3` 需要 C 编译器 |
 | ffmpeg | - | 可选，dat 图片/视频转换需要，需加入系统 PATH |
 
-## 2. 获取 wx_key.dll
+## 2. 获取 wx_key.dll（可选）
 
-项目编译不依赖此 DLL，但运行时需要它来获取微信密钥。
+项目编译不依赖此 DLL。程序内置了原生内存扫描方式获取密钥，DLL 只是一个可选的加速方案。
 
-从上游项目 [wx_key](https://github.com/ycccccccy/wx_key) 的 Release 页下载：
+如需使用 DLL 方式，从上游项目 [wx_key](https://github.com/ycccccccy/wx_key) 的 Release 页下载对应微信版本的 DLL，放到 `lib/windows_x64/wx_key.dll`。
 
-- **通用版**: `dlls` Release 中的 `wx_key.dll`
-- **版本专用**: 同一 Release 下有 `wx_key-4.1.x.xx.dll` 等针对特定微信版本的 DLL
-
-下载后放到项目的 `lib/windows_x64/` 目录下：
-
-```
-lib/
-└── windows_x64/
-    └── wx_key.dll
-```
-
-验证加载是否成功：
-
-```bash
-./bin/chatlog.exe version
-# 应看到: wx_key.dll 加载成功，将使用DLL方式获取密钥
-```
-
-如果加载失败，程序会降级为原生内存扫描方式（功能受限）。
+> DLL 导出函数与微信版本强绑定，版本不匹配时程序会自动降级为原生扫描，不影响使用。
 
 ## 3. 编译
 
@@ -51,34 +33,64 @@ make build
 
 ## 4. 获取微信密钥
 
-### 4.1 数据库密钥 (Data Key)
+微信 4.x 有两把独立的密钥，均通过扫描运行中的微信进程内存获取。
 
-**方式一：通过 chatlog TUI 获取**
+### 一键获取
 
 ```bash
-./bin/chatlog.exe
+./bin/chatlog.exe key
 ```
 
-启动 TUI 后：
-1. 启动微信（先不登录）
-2. 等待 chatlog 识别到微信 PID
-3. 登录微信
-4. 程序通过 DLL 自动捕获密钥
+程序会自动检测微信进程并提取两把密钥。成功后输出：
 
-**方式二：通过 wx_key 工具获取**
+```
+Data Key: [xxxxxxxx...]
+Image Key: [xxxxxxxx...]
+```
 
-从 [wx_key Releases](https://github.com/ycccccccy/wx_key/releases) 下载 `wx_key-windows-vX.X.X.zip`，解压后运行 `wx_key.exe`（Flutter GUI 应用）。
+密钥会自动保存到配置文件，后续启动 server 时无需再次手动指定。
+
+### 4.1 数据库密钥 (Data Key)
+
+- 用于解密 SQLCipher 加密的聊天记录数据库
+- 微信登录期间**长驻内存**，提取成功率高
+- 绑定账号 + 设备，**同一设备同一账号下保持不变**
+
+获取条件：微信已登录即可。
 
 ### 4.2 图片密钥 (Image Key)
 
-微信 4.x 的图片使用独立密钥加密，获取方式：
+- 用于解密 V2 格式的 `.dat` 图片文件（AES-128-ECB）
+- 密钥具有**易失性**，仅在查看图片时短暂加载到内存中
+- 格式为 16 字符 ASCII 字母数字字符串（`[a-zA-Z0-9]{16}`）
+- 同一设备同一账号下通常保持不变
+
+获取步骤：
 
 1. 确保微信已登录
-2. 在 chatlog TUI 选择「获取图片密钥」，或在 wx_key 工具中操作
-3. 在微信中打开朋友圈或聊天图片（点击大图），重复 2-3 次
-4. 工具会通过内存扫描自动获取密钥
+2. 运行 `./bin/chatlog.exe key`
+3. **在扫描的 60 秒内，切到微信点击打开几张图片（放大查看原图）**
+4. 程序扫描所有 Weixin 子进程的内存，匹配并验证候选密钥
 
-> 没有 img-key 时，聊天记录、联系人等功能正常，仅图片解密不可用。
+可选参数：
+
+| 参数 | 说明 |
+|------|------|
+| `-f` / `--force` | 强制重新扫描（忽略已缓存的密钥） |
+| `-x` / `--xor-key` | 同时显示 XOR Key |
+| `-p <pid>` | 多开微信时指定进程 PID |
+
+### 密钥是否会变？
+
+两把密钥绑定**账号 + 设备**，正常使用中保持不变。以下情况可能导致密钥变化：
+
+- 微信重新登录（退出后重新扫码）
+- 微信大版本更新
+- 重装微信或更换设备
+
+如果发现解密失败，用 `chatlog key -f` 强制重新获取即可。
+
+> 没有 Image Key 时，聊天记录、联系人等功能正常，仅图片解密不可用。
 
 ## 5. 确认微信数据目录
 
@@ -206,7 +218,10 @@ A: 启动时必须指定 `--platform windows --version 4`。
 A: 需要指定 `--work-dir` 参数，程序需要一个目录存放解密后的数据库。
 
 **Q: wx_key.dll 加载失败**
-A: 确认 DLL 放在 `lib/windows_x64/wx_key.dll`，且路径中不含中文。
+A: DLL 是可选的，程序会自动降级为原生内存扫描。如需使用 DLL，确认版本与微信匹配。
 
 **Q: 图片无法显示**
-A: 需要 img-key。通过 TUI 或 wx_key 工具获取后加 `--img-key` 参数。
+A: 需要 Image Key。运行 `chatlog key`，同时在微信中点击查看几张图片触发密钥加载。
+
+**Q: 图片密钥扫描超时**
+A: 确保在 60 秒扫描期间**主动点击打开微信图片**（放大查看原图）。密钥仅在查看图片的瞬间存在于内存中。
