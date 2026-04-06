@@ -36,3 +36,6 @@ tmpclaude-*/
 # Test files
 sns.md
 .claude/settings.local.json
+
+# Local startup script (contains keys/paths)
+start_server.bat
