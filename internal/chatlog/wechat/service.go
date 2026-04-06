@@ -119,10 +119,9 @@ func (s *Service) GetImageKey(info *wechat.Account) (string, error) {
 
 func (s *Service) StartAutoDecrypt() error {
 	log.Info().Msgf("start auto decrypt, data dir: %s", s.conf.GetDataDir())
-	pattern := `.*\.db$`
-	if s.conf.GetWalEnabled() {
-		pattern = `.*\.db(-wal|-shm)?$`
-	}
+	// Always monitor WAL files since WeChat uses WAL mode regardless of our setting.
+	// When WalEnabled is false, WAL changes still trigger a full re-decrypt of the main .db file.
+	pattern := `.*\.db(-wal|-shm)?$`
 	dbGroup, err := filemonitor.NewFileGroup("wechat", s.conf.GetDataDir(), pattern, []string{"fts"})
 	if err != nil {
 		return err
@@ -222,15 +221,8 @@ func (s *Service) waitAndProcess(dbFile string) {
 				}
 			}
 			if flags.sawDB {
-				if !s.conf.GetWalEnabled() || !workCopyExists {
-					if err := s.DecryptDBFile(dbFile); err != nil {
-						if s.errorHandler != nil {
-							s.errorHandler(err)
-						}
-					}
-					return
-				}
-				if flags.sawWal {
+				if flags.sawWal && workCopyExists {
+					// Both DB and WAL changed, try incremental first
 					handled, err := s.IncrementalDecryptDBFile(dbFile)
 					if err != nil {
 						if s.errorHandler != nil {
@@ -242,9 +234,15 @@ func (s *Service) waitAndProcess(dbFile string) {
 						return
 					}
 				}
+				// Full re-decrypt: new file, checkpoint update, or incremental failed
+				if err := s.DecryptDBFile(dbFile); err != nil {
+					if s.errorHandler != nil {
+						s.errorHandler(err)
+					}
+				}
 				return
 			}
-			if flags.sawWal && s.conf.GetWalEnabled() {
+			if flags.sawWal {
 				handled, err := s.IncrementalDecryptDBFile(dbFile)
 				if err != nil {
 					if s.errorHandler != nil {
@@ -464,9 +462,6 @@ func dbFilePriority(path string) int {
 }
 
 func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
-	if !s.conf.GetWalEnabled() {
-		return false, nil
-	}
 	walPath := dbFile + "-wal"
 	if _, err := os.Stat(walPath); err != nil {
 		if os.IsNotExist(err) {
