@@ -171,20 +171,24 @@ func SetAesKey(key string) {
 	if key == "" {
 		return
 	}
-	// Dart implementation uses asciiKey16 (taking first 16 chars/bytes)
-	// If the input is hex, decoding is fine, but if it's a raw string like "cfcd...",
-	// we should handle it carefully. Assuming input is hex string here as per original Go.
-	decoded, err := hex.DecodeString(key)
-	if err != nil {
-		// Fallback: if hex decode fails, use raw bytes if length is 16 (matching Dart logic partially)
-		if len(key) == 16 {
-			V4Format2.AesKey = []byte(key)
-			return
-		}
-		log.Error().Err(err).Msg("invalid aes key")
+	// V2 图片密钥是 16 字符 ASCII 字符串，直接用作 AES-128 key。
+	// 优先按 ASCII 处理（长度 16）；如果是 32 字符 hex 字符串则 decode 为 16 字节。
+	if len(key) == 16 {
+		V4Format2.AesKey = []byte(key)
 		return
 	}
-	V4Format2.AesKey = decoded
+	if len(key) == 32 {
+		if decoded, err := hex.DecodeString(key); err == nil {
+			V4Format2.AesKey = decoded
+			return
+		}
+	}
+	// 兜底: 直接使用前 16 字节
+	if len(key) >= 16 {
+		V4Format2.AesKey = []byte(key[:16])
+		return
+	}
+	log.Error().Msgf("invalid aes key length: %d (expected 16 or 32)", len(key))
 }
 
 // Dat2ImageV4 processes WeChat v4 dat image files
