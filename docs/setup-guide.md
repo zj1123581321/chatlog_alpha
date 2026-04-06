@@ -102,7 +102,46 @@ xwechat_files/
     └── chatlog.json      # chatlog 自动生成的配置
 ```
 
-## 6. 启动 Server
+## 6. 数据库解密
+
+### 解密机制
+
+Server 启动时会自动处理解密，无需手动操作：
+
+- **work-dir 为空** → 自动全量解密所有数据库到 work-dir
+- **数据库加载失败** → 自动重新解密
+
+`--auto-decrypt` 参数启用持续监控模式：
+- 使用 `fsnotify` 监控 data-dir 中 `.db` 文件的变化
+- 检测到文件写入/创建后，等待 1 秒防抖，然后自动解密变更的文件
+- 支持 WAL 模式的增量解密
+- 解密失败时自动停止服务并报错（熔断机制）
+
+### 单次手动解密
+
+如果只需要解密数据库而不启动 server，可以使用独立的 `decrypt` 命令：
+
+```bash
+./bin/chatlog.exe decrypt \
+  --platform windows \
+  --version 4 \
+  --data-dir "<微信数据目录>" \
+  --data-key "<数据库密钥>" \
+  --work-dir "<解密输出目录>"
+```
+
+### 图片批量解密
+
+图片（`.dat` 文件）的解密是独立的流程，需要 img-key：
+
+```bash
+./bin/chatlog.exe batch-decrypt \
+  --data-dir "<微信数据目录>" \
+  --data-key "<图片密钥>" \
+  ...
+```
+
+## 7. 启动 Server
 
 ### 命令行启动
 
@@ -119,16 +158,25 @@ xwechat_files/
 可选参数：
 - `--img-key "<图片密钥>"` — 启用图片解密
 - `--addr "0.0.0.0:5030"` — 自定义监听地址
+- `--auto-decrypt` — 启用持续监控，自动解密新数据（推荐开启）
 
 ### 使用启动脚本
 
-编辑项目根目录的 `start_server.bat`，填入你的密钥和路径，然后双击运行。
+项目根目录提供了 `start_server.bat` 启动脚本，通过环境变量配置：
 
-### 首次启动
+1. 创建 `.env.bat` 文件（已被 gitignore 排除）：
+   ```bat
+   set "CHATLOG_DATA_DIR=<微信数据目录>"
+   set "CHATLOG_WORK_DIR=<解密输出目录>"
+   set "CHATLOG_DATA_KEY=<数据库密钥>"
+   set "CHATLOG_IMG_KEY=<图片密钥，可留空>"
+   set "CHATLOG_ADDR=<监听地址，可留空>"
+   ```
+2. 双击 `start_server.bat` 即可启动
 
-首次启动时，程序会自动将加密数据库解密到 work-dir。后续启动如果 work-dir 已有数据，会跳过已解密的文件。开启 `--auto-decrypt` 后会监控数据目录，自动解密新增数据。
+也可以通过系统环境变量设置上述变量，无需 `.env.bat`。
 
-## 7. 使用
+## 8. 使用
 
 启动成功后访问：
 
@@ -145,7 +193,7 @@ xwechat_files/
 
 API 支持 `?format=json` 参数返回 JSON 格式。
 
-## 8. MCP 集成
+## 9. MCP 集成
 
 Server 同时提供 MCP (Model Context Protocol) 接口，可与 AI 助手集成使用。
 
