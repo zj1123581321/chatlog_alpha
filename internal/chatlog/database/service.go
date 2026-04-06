@@ -118,6 +118,9 @@ func (s *Service) GetSessions(key string, limit, offset int) (*wechatdb.GetSessi
 }
 
 func (s *Service) GetMedia(_type string, key string) (*model.Media, error) {
+	if s.db == nil {
+		return nil, nil
+	}
 	return s.db.GetMedia(_type, key)
 }
 
