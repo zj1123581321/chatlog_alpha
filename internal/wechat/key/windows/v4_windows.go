@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/rs/zerolog/log"
+	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/sys/windows"
 
 	"github.com/sjzar/chatlog/internal/errors"
@@ -19,6 +21,8 @@ import (
 
 const (
 	MEM_PRIVATE = 0x20000
+	MEM_MAPPED  = 0x40000
+	MEM_IMAGE   = 0x1000000
 	MaxWorkers  = 8
 )
 
@@ -29,12 +33,31 @@ func (e *V4Extractor) Extract(ctx context.Context, proc *model.Process) (string,
 		return "", "", fmt.Errorf("数据目录未就绪，无法进行图片密钥扫描，请确保微信已登录")
 	}
 
-	// Open process handle
-	handle, err := windows.OpenProcess(windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION, false, proc.PID)
-	if err != nil {
-		return "", "", errors.OpenProcessFailed(err)
+	// 收集所有 Weixin 进程的句柄（密钥可能在任意子进程中）
+	allPIDs := e.findAllWeixinPIDs(proc.PID)
+	var handles []windows.Handle
+	for _, pid := range allPIDs {
+		h, err := windows.OpenProcess(windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION, false, pid)
+		if err != nil {
+			log.Debug().Err(err).Msgf("无法打开进程 %d", pid)
+			continue
+		}
+		handles = append(handles, h)
 	}
-	defer windows.CloseHandle(handle)
+	if len(handles) == 0 {
+		// 降级: 只扫描主进程
+		h, err := windows.OpenProcess(windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION, false, proc.PID)
+		if err != nil {
+			return "", "", errors.OpenProcessFailed(err)
+		}
+		handles = append(handles, h)
+	}
+	defer func() {
+		for _, h := range handles {
+			windows.CloseHandle(h)
+		}
+	}()
+	log.Info().Msgf("将扫描 %d 个 Weixin 进程 (PIDs: %v)", len(allPIDs), allPIDs)
 
 	// 设置总超时时间：60秒
 	// 这给用户足够的时间去打开图片
@@ -104,20 +127,26 @@ func (e *V4Extractor) Extract(ctx context.Context, proc *model.Process) (string,
 		for index := 0; index < workerCount; index++ {
 			go func() {
 				defer workerWaitGroup.Done()
-				e.worker(scanCtx, handle, memoryChannel, resultChannel)
+				e.worker(scanCtx, handles[0], memoryChannel, resultChannel)
 			}()
 		}
 
-		// Start producer goroutine
+		// Start producer goroutines - 为每个进程启动一个 producer
 		var producerWaitGroup sync.WaitGroup
-		producerWaitGroup.Add(1)
+		producerWaitGroup.Add(len(handles))
+		for _, h := range handles {
+			go func(handle windows.Handle) {
+				defer producerWaitGroup.Done()
+				err := e.findMemory(scanCtx, handle, memoryChannel)
+				if err != nil {
+					log.Debug().Err(err).Msg("Failed to find memory regions")
+				}
+			}(h)
+		}
+		// 等所有 producer 完成后关闭 channel
 		go func() {
-			defer producerWaitGroup.Done()
-			defer close(memoryChannel) // Close channel when producer is done
-			err := e.findMemory(scanCtx, handle, memoryChannel)
-			if err != nil {
-				log.Err(err).Msg("Failed to find memory regions")
-			}
+			producerWaitGroup.Wait()
+			close(memoryChannel)
 		}()
 
 		// Wait for producer and consumers to complete IN BACKGROUND
@@ -191,28 +220,19 @@ func (e *V4Extractor) findMemory(ctx context.Context, handle windows.Handle, mem
 			break
 		}
 
-		// Skip small memory regions
-		if memInfo.RegionSize < 1024*1024 {
-			currentAddr += uintptr(memInfo.RegionSize)
-			continue
-		}
-
-		// Check if memory region is readable and private (Matching Dart logic)
-		// Dart: _isReadableProtect check (Not NOACCESS, Not GUARD)
+		// 扫描所有已提交的可读内存（MEM_PRIVATE + MEM_MAPPED + MEM_IMAGE）
 		isReadable := (memInfo.Protect&windows.PAGE_NOACCESS) == 0 && (memInfo.Protect&windows.PAGE_GUARD) == 0
-		if memInfo.State == windows.MEM_COMMIT && isReadable && memInfo.Type == MEM_PRIVATE {
-			// Calculate region size, ensure it doesn't exceed limit
+		isTargetType := memInfo.Type == MEM_PRIVATE || memInfo.Type == MEM_MAPPED || memInfo.Type == MEM_IMAGE
+		if memInfo.State == windows.MEM_COMMIT && isReadable && isTargetType {
 			regionSize := uintptr(memInfo.RegionSize)
 			if currentAddr+regionSize > maxAddr {
 				regionSize = maxAddr - currentAddr
 			}
 
-			// Read memory region
 			memory := make([]byte, regionSize)
 			if err = windows.ReadProcessMemory(handle, currentAddr, &memory[0], regionSize, nil); err == nil {
 				select {
 				case memoryChannel <- memory:
-					log.Debug().Msgf("Memory region for analysis: 0x%X - 0x%X, size: %d bytes", currentAddr, currentAddr+regionSize, regionSize)
 				case <-ctx.Done():
 					return nil
 				}
@@ -231,16 +251,32 @@ func (e *V4Extractor) worker(ctx context.Context, handle windows.Handle, memoryC
 	// Data Key scanning logic removed as per requirement.
 	// Native scanner is now exclusively for Image Key (Dart mode).
 
-	// Helper to check if byte is lowercase alphanumeric
-	isAlphaNumLower := func(b byte) bool {
-		return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+	// 匹配上游 wx_key: 支持大小写字母+数字
+	isAlphaNum := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 	}
 
-	// Track found keys
-	var imgKey string // dataKey removed
-	
-	// Logging flags and counters
-	candidateCount := 0
+	var imgKey string
+
+	// tryValidateAndReport 尝试验证候选密钥并报告结果
+	// candidate 是 16 字节的 ASCII 字符串，直接用作 AES-128 key
+	tryValidateAndReport := func(candidate []byte, mode string) bool {
+		if e.validator.ValidateImgKey(candidate) {
+			// 返回 ASCII 字符串形式的密钥（与上游 find_image_key.py 一致）
+			imgKey = string(candidate)
+			msg := fmt.Sprintf("找到图片密钥(%s)! Key: %s", mode, imgKey)
+			log.Info().Msg(msg)
+			if e.logger != nil {
+				e.logger.LogStatus(1, msg)
+			}
+			select {
+			case resultChannel <- [2]string{"", imgKey}:
+			case <-ctx.Done():
+			}
+			return true
+		}
+		return false
+	}
 
 	for {
 		select {
@@ -248,14 +284,6 @@ func (e *V4Extractor) worker(ctx context.Context, handle windows.Handle, memoryC
 			return
 		case memory, ok := <-memoryChannel:
 			if !ok {
-				// Memory scanning complete, return whatever keys we found
-				if candidateCount > 0 {
-					msg := fmt.Sprintf("内存扫描结束，共检查了 %d 个候选图片密钥字符串", candidateCount)
-					log.Debug().Msg(msg)
-					if e.logger != nil {
-						e.logger.LogDebug(msg)
-					}
-				}
 				if imgKey != "" {
 					select {
 					case resultChannel <- [2]string{"", imgKey}:
@@ -265,82 +293,61 @@ func (e *V4Extractor) worker(ctx context.Context, handle windows.Handle, memoryC
 				return
 			}
 
-			// Search for Image Key String (Scan for 32-byte alphanumeric string)
-			// Only if we haven't found ImgKey yet
-			if imgKey == "" {
-				if e.validator == nil {
-					// 理论上不会发生（Extract 会先等待验证样本就绪），这里仅做兜底避免空指针
+			if imgKey != "" {
+				continue
+			}
+			if e.validator == nil {
+				continue
+			}
+
+			// === 匹配 wechat-decrypt 的 _scan_regions 逻辑 ===
+			// 扫描所有连续字母数字序列，同时匹配32字符和16字符
+
+			i := 0
+			for i <= len(memory)-16 {
+				if !isAlphaNum(memory[i]) {
+					i++
+					continue
+				}
+				// 前边界检查
+				if i > 0 && isAlphaNum(memory[i-1]) {
+					i++
 					continue
 				}
 
-				// We scan the memory block for sequences of 32 alphanumeric characters
-				// The logic mimics img-key.dart: check boundaries and content
-				for i := 0; i <= len(memory)-32; i++ {
-					// Optimization: Check first byte
-					if !isAlphaNumLower(memory[i]) {
-						continue
+				// 计算连续字母数字序列的长度
+				seqLen := 0
+				for j := i; j < len(memory) && isAlphaNum(memory[j]); j++ {
+					seqLen++
+					if seqLen > 64 { // 防止超长序列浪费时间
+						break
 					}
+				}
 
-					// Boundary check: previous byte must NOT be alphanumeric (unless it's start of block)
-					// Note: strictly speaking we should check across blocks, but here we check within block
-					if i > 0 && isAlphaNumLower(memory[i-1]) {
-						continue
+				// 精确 32 字符: 先试前16字节作AES-128 key，再试完整32字节
+				if seqLen == 32 {
+					candidate32 := memory[i : i+32]
+					// 前16字节作为AES-128 key (wechat-decrypt 的主要逻辑)
+					if tryValidateAndReport(candidate32[:16], "32char-first16") {
+						return
 					}
+					// 完整32字节作为AES-256 key
+					if tryValidateAndReport(candidate32, "32char-full") {
+						return
+					}
+				}
 
-					// Check if we have 32 valid chars
-					isValid := true
-					for j := 1; j < 32; j++ {
-						if !isAlphaNumLower(memory[i+j]) {
-							isValid = false
-							i += j // Skip forward
-							break
-						}
+				// 精确 16 字符
+				if seqLen == 16 {
+					candidate16 := memory[i : i+16]
+					if tryValidateAndReport(candidate16, "16char") {
+						return
 					}
+				}
 
-					if !isValid {
-						continue
-					}
-
-					// Boundary check: next byte (33rd) must NOT be alphanumeric
-					if i+32 < len(memory) && isAlphaNumLower(memory[i+32]) {
-						continue
-					}
-
-					// Found a candidate 32-byte string
-					candidateCount++
-					if candidateCount % 5000 == 0 {
-						msg := fmt.Sprintf("正在扫描图片密钥... 已检查 %d 个候选字符串", candidateCount)
-						log.Debug().Msg(msg)
-						if e.logger != nil {
-							e.logger.LogDebug(msg)
-						}
-					}
-					
-					candidate := memory[i : i+32]
-					
-					// Validate using existing validator (which now supports the *_t.dat check)
-					// We pass the full 32 bytes, validator takes first 16
-					if e.validator.ValidateImgKey(candidate) {
-						// Found it!
-						// Return hex encoded first 16 bytes
-						foundKey := hex.EncodeToString(candidate[:16])
-						if imgKey == "" {
-							imgKey = foundKey
-							msg := fmt.Sprintf("通过字符串扫描找到图片密钥! (在检查了 %d 个候选后) Key: %s", candidateCount, foundKey)
-							log.Info().Msg(msg)
-							if e.logger != nil {
-								e.logger.LogStatus(1, msg)
-							}
-							select {
-							case resultChannel <- [2]string{"", imgKey}:
-							case <-ctx.Done():
-								return
-							}
-						}
-						
-						// Skip past this key
-						i += 32
-					}
+				i += seqLen
+				if seqLen == 0 {
+					i++
 				}
 			}
 		}
@@ -366,4 +373,31 @@ func (e *V4Extractor) validateKey(handle windows.Handle, addr uint64) (string, b
 	}
 
 	return "", false
+}
+
+// findAllWeixinPIDs 查找所有 Weixin 进程的 PID（包括子进程）
+func (e *V4Extractor) findAllWeixinPIDs(mainPID uint32) []uint32 {
+	pids := []uint32{mainPID}
+	seen := map[uint32]bool{mainPID: true}
+
+	processes, err := process.Processes()
+	if err != nil {
+		return pids
+	}
+
+	for _, p := range processes {
+		name, err := p.Name()
+		if err != nil {
+			continue
+		}
+		name = strings.TrimSuffix(name, ".exe")
+		if name == "Weixin" {
+			pid := uint32(p.Pid)
+			if !seen[pid] {
+				seen[pid] = true
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
 }

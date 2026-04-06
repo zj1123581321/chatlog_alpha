@@ -63,15 +63,34 @@ func init() {
 	procCleanupHook = modwxkey.NewProc("CleanupHook")
 	procGetLastErrorMsg = modwxkey.NewProc("GetLastErrorMsg")
 
-	// 检查所有函数是否都成功获取
-	if procInitializeHook != nil && procPollKeyData != nil && procGetStatusMessage != nil &&
-		procCleanupHook != nil && procGetLastErrorMsg != nil {
-		dllAvailable = true
-		log.Debug().Msg("wx_key.dll 加载成功，将使用DLL方式获取密钥")
-	} else {
+	// 检查所有函数是否都能找到（Find 会真正查找导出函数，避免 Call 时 panic）
+	if err := procInitializeHook.Find(); err != nil {
+		log.Debug().Err(err).Msg("wx_key.dll 缺少 InitializeHook，将使用原生方式")
 		dllAvailable = false
-		log.Debug().Msg("wx_key.dll 函数获取失败，将使用原生方式")
+		return
 	}
+	if err := procPollKeyData.Find(); err != nil {
+		log.Debug().Err(err).Msg("wx_key.dll 缺少 PollKeyData，将使用原生方式")
+		dllAvailable = false
+		return
+	}
+	if err := procGetStatusMessage.Find(); err != nil {
+		log.Debug().Err(err).Msg("wx_key.dll 缺少 GetStatusMessage，将使用原生方式")
+		dllAvailable = false
+		return
+	}
+	if err := procCleanupHook.Find(); err != nil {
+		log.Debug().Err(err).Msg("wx_key.dll 缺少 CleanupHook，将使用原生方式")
+		dllAvailable = false
+		return
+	}
+	if err := procGetLastErrorMsg.Find(); err != nil {
+		log.Debug().Err(err).Msg("wx_key.dll 缺少 GetLastErrorMsg，将使用原生方式")
+		dllAvailable = false
+		return
+	}
+	dllAvailable = true
+	log.Debug().Msg("wx_key.dll 加载成功，将使用DLL方式获取密钥")
 }
 
 // IsDLLAvailable 检查DLL是否可用

@@ -118,7 +118,7 @@ func (v *AesKeyValidator) Validate(key []byte) bool {
 	if len(key) < 16 {
 		return false
 	}
-	
+
 	// Dart implementation explicitly uses first 16 bytes
 	aesKey := key[:16]
 
@@ -134,11 +134,15 @@ func (v *AesKeyValidator) Validate(key []byte) bool {
 	decrypted := make([]byte, len(v.EncryptedData))
 	cipher.Decrypt(decrypted, v.EncryptedData)
 
-	// Dart implementation checks for JPG header: FF D8 FF
-	if bytes.HasPrefix(decrypted, []byte{0xFF, 0xD8, 0xFF}) {
+	// 检查所有已知图片格式头 (匹配 wechat-decrypt 的 try_key 逻辑)
+	for _, fmt := range Formats {
+		if bytes.HasPrefix(decrypted, fmt.Header) {
+			return true
+		}
+	}
+	// WEBP: RIFF header
+	if bytes.HasPrefix(decrypted, []byte("RIFF")) {
 		return true
 	}
-	
-	// Keep existing checks for backward compatibility
-	return bytes.HasPrefix(decrypted, JPG.Header) || bytes.HasPrefix(decrypted, WXGF.Header)
+	return false
 }
