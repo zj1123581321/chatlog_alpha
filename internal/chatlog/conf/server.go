@@ -18,6 +18,7 @@ type ServerConfig struct {
 	WalEnabled         bool     `mapstructure:"wal_enabled"`
 	AutoDecryptDebounce int     `mapstructure:"auto_decrypt_debounce"`
 	SaveDecryptedMedia bool     `mapstructure:"save_decrypted_media"`
+	BackupPath         string   `mapstructure:"backup_path"`
 	Webhook            *Webhook `mapstructure:"webhook"`
 }
 
@@ -74,4 +75,8 @@ func (c *ServerConfig) GetWebhook() *Webhook {
 
 func (c *ServerConfig) GetSaveDecryptedMedia() bool {
 	return c.SaveDecryptedMedia
+}
+
+func (c *ServerConfig) GetBackupPath() string {
+	return c.BackupPath
 }

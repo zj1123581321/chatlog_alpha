@@ -216,6 +216,11 @@ func (c *Context) GetSaveDecryptedMedia() bool {
 	return true
 }
 
+// GetBackupPath 返回备份目录路径，未配置时返回空字符串。
+func (c *Context) GetBackupPath() string {
+	return ""
+}
+
 func (c *Context) SetHTTPEnabled(enabled bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

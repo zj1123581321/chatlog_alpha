@@ -34,6 +34,7 @@ type Config interface {
 	GetHTTPAddr() string
 	GetDataDir() string
 	GetSaveDecryptedMedia() bool
+	GetBackupPath() string
 }
 
 func NewService(conf Config, db *database.Service) *Service {

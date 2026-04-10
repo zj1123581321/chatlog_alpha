@@ -31,6 +31,7 @@ func (s *Service) initRouter() {
 	s.initBaseRouter()
 	s.initMediaRouter()
 	s.initAPIRouter()
+	s.initBackupRouter()
 	s.initMCPRouter()
 }
 
