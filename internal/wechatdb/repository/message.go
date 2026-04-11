@@ -74,6 +74,23 @@ func (r *Repository) enrichMessage(msg *model.Message) {
 			msg.SenderName = contact.DisplayName()
 		}
 	}
+
+	// 补充引用消息的发送者显示名称
+	if refer, ok := msg.Contents["refer"].(*model.Message); ok && refer.SenderName == "" {
+		if msg.IsChatRoom {
+			if chatRoom, ok := r.chatRoomCache[msg.Talker]; ok {
+				if displayName, ok := chatRoom.User2DisplayName[refer.Sender]; ok {
+					refer.SenderName = displayName
+				}
+			}
+		}
+		if refer.SenderName == "" {
+			contact := r.getFullContact(refer.Sender)
+			if contact != nil {
+				refer.SenderName = contact.DisplayName()
+			}
+		}
+	}
 }
 
 func (r *Repository) parseTalkerAndSender(ctx context.Context, talker, sender string) (string, string) {
