@@ -5,6 +5,7 @@
 *.exe
 *.exe~
 *.dll
+!lib/windows_x64/wx_key.dll
 *.so
 *.dylib
 
