@@ -580,6 +580,11 @@ func (a *App) settingSelected(i *menu.Item) {
 			description: "配置自动解密触发间隔(ms)",
 			action:      a.settingAutoDecryptDebounce,
 		},
+		{
+			name:        "设置备份目录",
+			description: "配置 backup 图片所在目录",
+			action:      a.settingBackupPath,
+		},
 	}
 
 	subMenu := menu.NewSubMenu("设置")
@@ -801,6 +806,33 @@ func (a *App) settingAutoDecryptDebounce() {
 		a.ctx.SetAutoDecryptDebounce(value)
 		a.mainPages.RemovePage("submenu2")
 		a.showInfo(fmt.Sprintf("去抖时长已设置为 %dms", value))
+	})
+
+	formView.AddButton("取消", func() {
+		a.mainPages.RemovePage("submenu2")
+	})
+
+	a.mainPages.AddPage("submenu2", formView, true, true)
+	a.SetFocus(formView)
+}
+
+func (a *App) settingBackupPath() {
+	formView := form.NewForm("设置备份目录")
+
+	tempBackupPath := a.ctx.GetBackupPath()
+
+	formView.AddInputField("备份目录", tempBackupPath, 0, nil, func(text string) {
+		tempBackupPath = text
+	})
+
+	formView.AddButton("保存", func() {
+		a.ctx.SetBackupPath(tempBackupPath)
+		a.mainPages.RemovePage("submenu2")
+		if tempBackupPath == "" {
+			a.showInfo("备份目录已清除")
+		} else {
+			a.showInfo("备份目录已设置为 " + tempBackupPath)
+		}
 	})
 
 	formView.AddButton("取消", func() {

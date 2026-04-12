@@ -216,9 +216,24 @@ func (c *Context) GetSaveDecryptedMedia() bool {
 	return true
 }
 
-// GetBackupPath 返回备份目录路径，未配置时返回空字符串。
+// GetBackupPath 返回备份目录路径。优先使用环境变量 CHATLOG_BACKUP_PATH，其次读取配置文件。
 func (c *Context) GetBackupPath() string {
-	return ""
+	if v := os.Getenv("CHATLOG_BACKUP_PATH"); v != "" {
+		return v
+	}
+	return c.conf.BackupPath
+}
+
+func (c *Context) SetBackupPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conf.BackupPath == path {
+		return
+	}
+	c.conf.BackupPath = path
+	if err := c.cm.SetConfig("backup_path", path); err != nil {
+		log.Error().Err(err).Msg("set backup_path failed")
+	}
 }
 
 func (c *Context) SetHTTPEnabled(enabled bool) {
