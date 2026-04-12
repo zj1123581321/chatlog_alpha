@@ -106,6 +106,7 @@ func (c *Context) SwitchHistory(account string) {
 		c.HTTPEnabled = history.HTTPEnabled
 		c.HTTPAddr = history.HTTPAddr
 		c.WalEnabled = history.WalEnabled
+		c.AutoDecrypt = history.AutoDecrypt
 		c.AutoDecryptDebounce = history.AutoDecryptDebounce
 	} else {
 		c.Account = ""
@@ -119,6 +120,7 @@ func (c *Context) SwitchHistory(account string) {
 		c.HTTPEnabled = false
 		c.HTTPAddr = ""
 		c.WalEnabled = false
+		c.AutoDecrypt = false
 		c.AutoDecryptDebounce = 0
 	}
 }
@@ -334,6 +336,7 @@ func (c *Context) UpdateConfig() {
 		HTTPEnabled: c.HTTPEnabled,
 		HTTPAddr:    c.HTTPAddr,
 		WalEnabled:  c.WalEnabled,
+		AutoDecrypt: c.AutoDecrypt,
 		AutoDecryptDebounce: c.AutoDecryptDebounce,
 	}
 

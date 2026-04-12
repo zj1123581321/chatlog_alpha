@@ -65,6 +65,21 @@ func (m *Manager) Run(configPath string) error {
 			m.StopService()
 		}
 	}
+	if m.ctx.AutoDecrypt {
+		// 重置状态，由后台协程在成功后重新设置
+		m.ctx.AutoDecrypt = false
+		go func() {
+			if err := m.StartAutoDecrypt(true); err != nil {
+				log.Info().Err(err).Msg("恢复自动解密失败")
+				m.ctx.SetAutoDecrypt(false)
+			}
+			if m.app != nil {
+				m.app.QueueUpdateDraw(func() {
+					m.app.updateMenuItemsState()
+				})
+			}
+		}()
+	}
 	// 启动终端UI
 	m.app = NewApp(m.ctx, m)
 	m.app.Run() // 阻塞
@@ -345,15 +360,18 @@ func (m *Manager) DecryptDBFiles() error {
 	return nil
 }
 
-func (m *Manager) StartAutoDecrypt() error {
+// StartAutoDecrypt 开启自动解密。
+// skipPrecheck 为 true 时跳过全量预检解密（用于启动恢复场景，依赖熔断机制兜底）。
+func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) error {
 	if m.ctx.DataKey == "" || m.ctx.DataDir == "" {
 		return fmt.Errorf("请先获取密钥")
 	}
 
-	// 尝试运行一次解密，验证环境和密钥是否正常
-	// 如果解密失败，说明配置或环境有问题，不应开启自动解密
-	if err := m.DecryptDBFiles(); err != nil {
-		return fmt.Errorf("初始解密失败，无法开启自动解密: %w", err)
+	if len(skipPrecheck) == 0 || !skipPrecheck[0] {
+		// 首次开启：尝试运行一次解密，验证环境和密钥是否正常
+		if err := m.DecryptDBFiles(); err != nil {
+			return fmt.Errorf("初始解密失败，无法开启自动解密: %w", err)
+		}
 	}
 
 	if m.ctx.WorkDir == "" {
