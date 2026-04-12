@@ -169,51 +169,58 @@ func (a *App) refresh() {
 			if a.ctx.AutoDecrypt || a.ctx.HTTPEnabled {
 				a.m.RefreshSession()
 			}
-			a.infoBar.UpdateAccount(a.ctx.Account)
-			a.infoBar.UpdateBasicInfo(a.ctx.PID, a.ctx.FullVersion, a.ctx.ExePath)
-			statusText := a.ctx.Status
-			if a.ctx.PID == 0 && processErr != nil {
-				statusText = fmt.Sprintf("[red]获取进程失败: %v[white]", processErr)
-			}
-			a.infoBar.UpdateStatus(statusText)
-			a.infoBar.UpdateDataKey(a.ctx.DataKey)
-			a.infoBar.UpdateImageKey(a.ctx.ImgKey)
-			a.infoBar.UpdatePlatform(a.ctx.Platform)
-			a.infoBar.UpdateDataUsageDir(a.ctx.DataUsage, a.ctx.DataDir)
-			a.infoBar.UpdateWorkUsageDir(a.ctx.WorkUsage, a.ctx.WorkDir)
-			if a.ctx.LastSession.Unix() > 1000000000 {
-				a.infoBar.UpdateSession(a.ctx.LastSession.Format("2006-01-02 15:04:05"))
-			}
-			if a.ctx.HTTPEnabled {
-				a.infoBar.UpdateHTTPServer(fmt.Sprintf("[green][已启动][white] [%s]", a.ctx.HTTPAddr))
-			} else {
-				a.infoBar.UpdateHTTPServer("[未启动]")
-			}
-			autoDecryptText := "[未开启]"
-			if a.ctx.AutoDecrypt {
-				if a.ctx.AutoDecryptDebounce > 0 {
-					autoDecryptText = fmt.Sprintf("[green][已开启][white] %dms", a.ctx.AutoDecryptDebounce)
-				} else {
-					autoDecryptText = "[green][已开启][white]"
-				}
-			}
-			a.infoBar.UpdateAutoDecrypt(autoDecryptText)
-			if a.ctx.WalEnabled {
-				a.infoBar.UpdateWal("[green][已启用][white]")
-			} else {
-				a.infoBar.UpdateWal("[未启用]")
-			}
 
-			// Update latest message in footer
+			// 收集最新消息数据（在 QueueUpdateDraw 外部，避免阻塞 UI 线程）
+			var latestSender, latestTime, latestContent string
 			if session, err := a.m.GetLatestSession(); err == nil && session != nil {
-				sender := session.NickName
-				if sender == "" {
-					sender = session.UserName
+				latestSender = session.NickName
+				if latestSender == "" {
+					latestSender = session.UserName
 				}
-			a.footer.UpdateLatestMessage(sender, session.NTime.Format("15:04:05"), session.Content)
+				latestTime = session.NTime.Format("15:04:05")
+				latestContent = session.Content
 			}
 
-			a.Draw()
+			a.QueueUpdateDraw(func() {
+				a.infoBar.UpdateAccount(a.ctx.Account)
+				a.infoBar.UpdateBasicInfo(a.ctx.PID, a.ctx.FullVersion, a.ctx.ExePath)
+				statusText := a.ctx.Status
+				if a.ctx.PID == 0 && processErr != nil {
+					statusText = fmt.Sprintf("[red]获取进程失败: %v[white]", processErr)
+				}
+				a.infoBar.UpdateStatus(statusText)
+				a.infoBar.UpdateDataKey(a.ctx.DataKey)
+				a.infoBar.UpdateImageKey(a.ctx.ImgKey)
+				a.infoBar.UpdatePlatform(a.ctx.Platform)
+				a.infoBar.UpdateDataUsageDir(a.ctx.DataUsage, a.ctx.DataDir)
+				a.infoBar.UpdateWorkUsageDir(a.ctx.WorkUsage, a.ctx.WorkDir)
+				if a.ctx.LastSession.Unix() > 1000000000 {
+					a.infoBar.UpdateSession(a.ctx.LastSession.Format("2006-01-02 15:04:05"))
+				}
+				if a.ctx.HTTPEnabled {
+					a.infoBar.UpdateHTTPServer(fmt.Sprintf("[green][已启动][white] [%s]", a.ctx.HTTPAddr))
+				} else {
+					a.infoBar.UpdateHTTPServer("[未启动]")
+				}
+				autoDecryptText := "[未开启]"
+				if a.ctx.AutoDecrypt {
+					if a.ctx.AutoDecryptDebounce > 0 {
+						autoDecryptText = fmt.Sprintf("[green][已开启][white] %dms", a.ctx.AutoDecryptDebounce)
+					} else {
+						autoDecryptText = "[green][已开启][white]"
+					}
+				}
+				a.infoBar.UpdateAutoDecrypt(autoDecryptText)
+				if a.ctx.WalEnabled {
+					a.infoBar.UpdateWal("[green][已启用][white]")
+				} else {
+					a.infoBar.UpdateWal("[未启用]")
+				}
+
+				if latestSender != "" {
+					a.footer.UpdateLatestMessage(latestSender, latestTime, latestContent)
+				}
+			})
 		}
 	}
 }
