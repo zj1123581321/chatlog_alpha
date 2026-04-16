@@ -54,20 +54,21 @@ func (m *Manager) Run(configPath string) error {
 
 	m.http = http.NewService(m.ctx, m.db)
 
-	m.ctx.WeChatInstances = m.wechat.GetWeChatInstances()
-	if len(m.ctx.WeChatInstances) >= 1 {
-		m.ctx.SwitchCurrent(m.ctx.WeChatInstances[0])
+	m.ctx.SetWeChatInstances(m.wechat.GetWeChatInstances())
+	instances := m.ctx.GetWeChatInstances()
+	if len(instances) >= 1 {
+		m.ctx.SwitchCurrent(instances[0])
 	}
 
-	if m.ctx.HTTPEnabled {
+	if m.ctx.GetHTTPEnabled() {
 		// 启动HTTP服务
 		if err := m.StartService(); err != nil {
 			m.StopService()
 		}
 	}
-	if m.ctx.AutoDecrypt {
+	if m.ctx.GetAutoDecrypt() {
 		// 重置状态，由后台协程在成功后重新设置
-		m.ctx.AutoDecrypt = false
+		m.ctx.SetAutoDecrypt(false)
 		go func() {
 			if err := m.StartAutoDecrypt(true); err != nil {
 				log.Info().Err(err).Msg("恢复自动解密失败")
@@ -87,12 +88,12 @@ func (m *Manager) Run(configPath string) error {
 }
 
 func (m *Manager) Switch(info *iwechat.Account, history string) error {
-	if m.ctx.AutoDecrypt {
+	if m.ctx.GetAutoDecrypt() {
 		if err := m.StopAutoDecrypt(); err != nil {
 			return err
 		}
 	}
-	if m.ctx.HTTPEnabled {
+	if m.ctx.GetHTTPEnabled() {
 		if err := m.stopService(); err != nil {
 			return err
 		}
@@ -103,7 +104,7 @@ func (m *Manager) Switch(info *iwechat.Account, history string) error {
 		m.ctx.SwitchHistory(history)
 	}
 
-	if m.ctx.HTTPEnabled {
+	if m.ctx.GetHTTPEnabled() {
 		// 启动HTTP服务
 		if err := m.StartService(); err != nil {
 			log.Info().Err(err).Msg("启动服务失败")
@@ -126,9 +127,9 @@ func (m *Manager) StartService() error {
 	}
 
 	// 如果是 4.0 版本，更新下 xorkey
-	if m.ctx.Version == 4 {
-		dat2img.SetAesKey(m.ctx.ImgKey)
-		go dat2img.ScanAndSetXorKey(m.ctx.DataDir)
+	if m.ctx.GetVersion() == 4 {
+		dat2img.SetAesKey(m.ctx.GetImgKey())
+		go dat2img.ScanAndSetXorKey(m.ctx.GetDataDir())
 	}
 
 	// 更新状态
@@ -184,10 +185,11 @@ func (m *Manager) SetHTTPAddr(text string) error {
 }
 
 func (m *Manager) GetDataKey() error {
-	if m.ctx.Current == nil {
+	cur := m.ctx.GetCurrent()
+	if cur == nil {
 		return fmt.Errorf("未选择任何账号")
 	}
-	if _, err := m.wechat.GetDataKey(m.ctx.Current); err != nil {
+	if _, err := m.wechat.GetDataKey(cur); err != nil {
 		return err
 	}
 	m.ctx.Refresh()
@@ -196,10 +198,11 @@ func (m *Manager) GetDataKey() error {
 }
 
 func (m *Manager) GetImageKey() error {
-	if m.ctx.Current == nil {
+	cur := m.ctx.GetCurrent()
+	if cur == nil {
 		return fmt.Errorf("未选择任何账号")
 	}
-	if _, err := m.wechat.GetImageKey(m.ctx.Current); err != nil {
+	if _, err := m.wechat.GetImageKey(cur); err != nil {
 		return err
 	}
 	m.ctx.Refresh()
@@ -208,12 +211,13 @@ func (m *Manager) GetImageKey() error {
 }
 
 func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
-	if m.ctx.Current == nil {
+	cur := m.ctx.GetCurrent()
+	if cur == nil {
 		return fmt.Errorf("未选择任何账号")
 	}
 
-	pid := m.ctx.Current.PID
-	exePath := m.ctx.Current.ExePath
+	pid := cur.PID
+	exePath := cur.ExePath
 
 	// 1. Terminate the process
 	if onStatus != nil {
@@ -302,7 +306,8 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 		}
 
 		// 尝试获取密钥 (会尝试初始化DLL)
-		key, imgKey, err = m.ctx.Current.GetKey(ctx)
+		curForKey := m.ctx.GetCurrent()
+		key, imgKey, err = curForKey.GetKey(ctx)
 
 		// 如果成功，跳出循环
 		// 注意：GetKey 成功意味着 Hook 安装成功且已经获取到了密钥
@@ -330,8 +335,8 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 		time.Sleep(1 * time.Second)
 	}
 
-	m.ctx.DataKey = key
-	m.ctx.ImgKey = imgKey
+	m.ctx.SetDataKey(key)
+	m.ctx.SetImgKey(imgKey)
 	m.ctx.Refresh()
 	m.ctx.UpdateConfig()
 
@@ -340,16 +345,16 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 }
 
 func (m *Manager) DecryptDBFiles() error {
-	if m.ctx.DataKey == "" {
-		if m.ctx.Current == nil {
+	if m.ctx.GetDataKey() == "" {
+		if m.ctx.GetCurrent() == nil {
 			return fmt.Errorf("未选择任何账号")
 		}
 		if err := m.GetDataKey(); err != nil {
 			return err
 		}
 	}
-	if m.ctx.WorkDir == "" {
-		m.ctx.WorkDir = util.DefaultWorkDir(m.ctx.Account)
+	if m.ctx.GetWorkDir() == "" {
+		m.ctx.SetWorkDir(util.DefaultWorkDir(m.ctx.GetAccount()))
 	}
 
 	if err := m.wechat.DecryptDBFiles(); err != nil {
@@ -363,7 +368,7 @@ func (m *Manager) DecryptDBFiles() error {
 // StartAutoDecrypt 开启自动解密。
 // skipPrecheck 为 true 时跳过全量预检解密（用于启动恢复场景，依赖熔断机制兜底）。
 func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) error {
-	if m.ctx.DataKey == "" || m.ctx.DataDir == "" {
+	if m.ctx.GetDataKey() == "" || m.ctx.GetDataDir() == "" {
 		return fmt.Errorf("请先获取密钥")
 	}
 
@@ -374,7 +379,7 @@ func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) error {
 		}
 	}
 
-	if m.ctx.WorkDir == "" {
+	if m.ctx.GetWorkDir() == "" {
 		return fmt.Errorf("请先执行解密数据")
 	}
 
@@ -420,7 +425,7 @@ func (m *Manager) RefreshSession() error {
 	if len(resp.Items) == 0 {
 		return nil
 	}
-	m.ctx.LastSession = resp.Items[0].NTime
+	m.ctx.SetLastSession(resp.Items[0].NTime)
 	return nil
 }
 
@@ -450,20 +455,21 @@ func (m *Manager) CommandKey(configPath string, pid int, force bool, showXorKey 
 
 	m.wechat = wechat.NewService(m.ctx)
 
-	m.ctx.WeChatInstances = m.wechat.GetWeChatInstances()
-	if len(m.ctx.WeChatInstances) == 0 {
+	m.ctx.SetWeChatInstances(m.wechat.GetWeChatInstances())
+	allInstances := m.ctx.GetWeChatInstances()
+	if len(allInstances) == 0 {
 		return "", fmt.Errorf("wechat process not found")
 	}
 
-	if len(m.ctx.WeChatInstances) == 1 {
+	if len(allInstances) == 1 {
 		// 确保当前账户已设置
-		if m.ctx.Current == nil {
-			m.ctx.SwitchCurrent(m.ctx.WeChatInstances[0])
+		if m.ctx.GetCurrent() == nil {
+			m.ctx.SwitchCurrent(allInstances[0])
 		}
 
-		key, imgKey := m.ctx.DataKey, m.ctx.ImgKey
+		key, imgKey := m.ctx.GetDataKey(), m.ctx.GetImgKey()
 		if len(key) == 0 || len(imgKey) == 0 || force {
-			key, imgKey, err = m.ctx.WeChatInstances[0].GetKey(context.Background())
+			key, imgKey, err = allInstances[0].GetKey(context.Background())
 			if err != nil {
 				return "", err
 			}
@@ -472,8 +478,8 @@ func (m *Manager) CommandKey(configPath string, pid int, force bool, showXorKey 
 		}
 
 		result := fmt.Sprintf("Data Key: [%s]\nImage Key: [%s]", key, imgKey)
-		if m.ctx.Version == 4 && showXorKey {
-			if b, err := dat2img.ScanAndSetXorKey(m.ctx.DataDir); err == nil {
+		if m.ctx.GetVersion() == 4 && showXorKey {
+			if b, err := dat2img.ScanAndSetXorKey(m.ctx.GetDataDir()); err == nil {
 				result += fmt.Sprintf("\nXor Key: [0x%X]", b)
 			}
 		}
@@ -482,15 +488,16 @@ func (m *Manager) CommandKey(configPath string, pid int, force bool, showXorKey 
 	}
 	if pid == 0 {
 		str := "Select a process:\n"
-		for _, ins := range m.ctx.WeChatInstances {
+		for _, ins := range allInstances {
 			str += fmt.Sprintf("PID: %d. %s[Version: %s Data Dir: %s ]\n", ins.PID, ins.Name, ins.FullVersion, ins.DataDir)
 		}
 		return str, nil
 	}
-	for _, ins := range m.ctx.WeChatInstances {
+	for _, ins := range allInstances {
 		if ins.PID == uint32(pid) {
 			// 确保当前账户已设置
-			if m.ctx.Current == nil || m.ctx.Current.PID != ins.PID {
+			cur := m.ctx.GetCurrent()
+			if cur == nil || cur.PID != ins.PID {
 				m.ctx.SwitchCurrent(ins)
 			}
 
@@ -504,8 +511,8 @@ func (m *Manager) CommandKey(configPath string, pid int, force bool, showXorKey 
 				m.ctx.UpdateConfig()
 			}
 			result := fmt.Sprintf("Data Key: [%s]\nImage Key: [%s]", key, imgKey)
-			if m.ctx.Version == 4 && showXorKey {
-				if b, err := dat2img.ScanAndSetXorKey(m.ctx.DataDir); err == nil {
+			if m.ctx.GetVersion() == 4 && showXorKey {
+				if b, err := dat2img.ScanAndSetXorKey(m.ctx.GetDataDir()); err == nil {
 					result += fmt.Sprintf("\nXor Key: [0x%X]", b)
 				}
 			}

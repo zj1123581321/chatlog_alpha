@@ -167,8 +167,6 @@ func (m *SubMenu) refresh() {
 }
 
 func (m *SubMenu) Draw(screen tcell.Screen) {
-	m.refresh()
-
 	m.Box.DrawForSubclass(screen, m)
 	m.layout.Draw(screen)
 }

@@ -20,47 +20,70 @@ const (
 	DefalutHTTPAddr = "127.0.0.1:5030"
 )
 
-// Context is a context for a chatlog.
-// It is used to store information about the chatlog.
+// Snapshot holds a read-only copy of all UI-visible Context fields.
+// Obtained via GetSnapshot() with a single RLock, used by the TUI refresh loop.
+type Snapshot struct {
+	Account             string
+	PID                 int
+	FullVersion         string
+	ExePath             string
+	Status              string
+	DataKey             string
+	ImgKey              string
+	Platform            string
+	DataUsage           string
+	DataDir             string
+	WorkUsage           string
+	WorkDir             string
+	HTTPAddr            string
+	HTTPEnabled         bool
+	AutoDecrypt         bool
+	AutoDecryptDebounce int
+	WalEnabled          bool
+	LastSession         time.Time
+}
+
+// Context is the shared application state for chatlog.
+// All fields are private and must be accessed through thread-safe getter/setter methods.
 type Context struct {
 	conf *conf.TUIConfig
 	cm   *config.Manager
 	mu   sync.RWMutex
 
-	History map[string]conf.ProcessConfig
+	history map[string]conf.ProcessConfig
 
-	// 微信账号相关状态
-	Account     string
-	Platform    string
-	Version     int
-	FullVersion string
-	DataDir     string
-	DataKey     string
-	DataUsage   string
-	ImgKey      string
+	// wechat account state
+	account     string
+	platform    string
+	version     int
+	fullVersion string
+	dataDir     string
+	dataKey     string
+	dataUsage   string
+	imgKey      string
 
-	// 工作目录相关状态
-	WorkDir   string
-	WorkUsage string
+	// work directory state
+	workDir   string
+	workUsage string
 
-	// HTTP服务相关状态
-	HTTPEnabled bool
-	HTTPAddr    string
+	// HTTP service state
+	httpEnabled bool
+	httpAddr    string
 
-	// 自动解密
-	AutoDecrypt bool
-	LastSession time.Time
-	WalEnabled  bool
-	AutoDecryptDebounce int
+	// auto decrypt
+	autoDecrypt         bool
+	lastSession         time.Time
+	walEnabled          bool
+	autoDecryptDebounce int
 
-	// 当前选中的微信实例
-	Current *wechat.Account
-	PID     int
-	ExePath string
-	Status  string
+	// current wechat instance
+	current *wechat.Account
+	pid     int
+	exePath string
+	status  string
 
-	// 所有可用的微信实例
-	WeChatInstances []*wechat.Account
+	// all available wechat instances
+	weChatInstances []*wechat.Account
 }
 
 func New(configPath string) (*Context, error) {
@@ -71,8 +94,9 @@ func New(configPath string) (*Context, error) {
 	}
 
 	ctx := &Context{
-		conf: conf,
-		cm:   tcm,
+		conf:     conf,
+		cm:       tcm,
+		httpAddr: DefalutHTTPAddr,
 	}
 
 	ctx.loadConfig()
@@ -81,263 +105,140 @@ func New(configPath string) (*Context, error) {
 }
 
 func (c *Context) loadConfig() {
-	c.History = c.conf.ParseHistory()
-	c.SwitchHistory(c.conf.LastAccount)
-	c.Refresh()
+	c.history = c.conf.ParseHistory()
+	c.switchHistory(c.conf.LastAccount)
+	c.refresh()
 }
+
+// --- Public lock-acquiring entry points ---
 
 func (c *Context) SwitchHistory(account string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.Current = nil
-	c.PID = 0
-	c.ExePath = ""
-	c.Status = ""
-	history, ok := c.History[account]
-	if ok {
-		c.Account = history.Account
-		c.Platform = history.Platform
-		c.Version = history.Version
-		c.FullVersion = history.FullVersion
-		c.DataKey = history.DataKey
-		c.ImgKey = history.ImgKey
-		c.DataDir = history.DataDir
-		c.WorkDir = history.WorkDir
-		c.HTTPEnabled = history.HTTPEnabled
-		c.HTTPAddr = history.HTTPAddr
-		c.WalEnabled = history.WalEnabled
-		c.AutoDecrypt = history.AutoDecrypt
-		c.AutoDecryptDebounce = history.AutoDecryptDebounce
-	} else {
-		c.Account = ""
-		c.Platform = ""
-		c.Version = 0
-		c.FullVersion = ""
-		c.DataKey = ""
-		c.ImgKey = ""
-		c.DataDir = ""
-		c.WorkDir = ""
-		c.HTTPEnabled = false
-		c.HTTPAddr = ""
-		c.WalEnabled = false
-		c.AutoDecrypt = false
-		c.AutoDecryptDebounce = 0
-	}
+	c.switchHistory(account)
 }
 
 func (c *Context) SwitchCurrent(info *wechat.Account) {
-	c.SwitchHistory(info.Name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.Current = info
-	c.Refresh()
-
+	c.switchHistory(info.Name)
+	c.current = info
+	c.refresh()
 }
-func (c *Context) Refresh() {
-	if c.Current != nil {
-		c.Account = c.Current.Name
-		c.Platform = c.Current.Platform
-		c.Version = c.Current.Version
-		c.FullVersion = c.Current.FullVersion
-		c.PID = int(c.Current.PID)
-		c.ExePath = c.Current.ExePath
-		c.Status = c.Current.Status
-		// 更新密钥数据 - 总是从Current同步到Context
-		// 仅在Current中的密钥为非空时，才更新Context，以避免覆盖已有的有效密钥
-		if c.Current.Key != "" {
-			c.DataKey = c.Current.Key
-		}
-		if c.Current.ImgKey != "" {
-			c.ImgKey = c.Current.ImgKey
-		}
-		if c.Current.DataDir != c.DataDir {
-			c.DataDir = c.Current.DataDir
-		}
 
+func (c *Context) Refresh() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refresh()
+}
+
+func (c *Context) UpdateConfig() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updateConfig()
+}
+
+// --- Private lock-free internal methods (caller must hold mu) ---
+
+func (c *Context) switchHistory(account string) {
+	c.current = nil
+	c.pid = 0
+	c.exePath = ""
+	c.status = ""
+	history, ok := c.history[account]
+	if ok {
+		c.account = history.Account
+		c.platform = history.Platform
+		c.version = history.Version
+		c.fullVersion = history.FullVersion
+		c.dataKey = history.DataKey
+		c.imgKey = history.ImgKey
+		c.dataDir = history.DataDir
+		c.workDir = history.WorkDir
+		c.httpEnabled = history.HTTPEnabled
+		c.httpAddr = history.HTTPAddr
+		c.walEnabled = history.WalEnabled
+		c.autoDecrypt = history.AutoDecrypt
+		c.autoDecryptDebounce = history.AutoDecryptDebounce
+	} else {
+		c.account = ""
+		c.platform = ""
+		c.version = 0
+		c.fullVersion = ""
+		c.dataKey = ""
+		c.imgKey = ""
+		c.dataDir = ""
+		c.workDir = ""
+		c.httpEnabled = false
+		c.httpAddr = ""
+		c.walEnabled = false
+		c.autoDecrypt = false
+		c.autoDecryptDebounce = 0
 	}
-	if c.DataUsage == "" && c.DataDir != "" {
+	if c.httpAddr == "" {
+		c.httpAddr = DefalutHTTPAddr
+	}
+}
+
+func (c *Context) refresh() {
+	if c.current != nil {
+		c.account = c.current.Name
+		c.platform = c.current.Platform
+		c.version = c.current.Version
+		c.fullVersion = c.current.FullVersion
+		c.pid = int(c.current.PID)
+		c.exePath = c.current.ExePath
+		c.status = c.current.Status
+		if c.current.Key != "" {
+			c.dataKey = c.current.Key
+		}
+		if c.current.ImgKey != "" {
+			c.imgKey = c.current.ImgKey
+		}
+		if c.current.DataDir != c.dataDir {
+			c.dataDir = c.current.DataDir
+		}
+	}
+	if c.dataUsage == "" && c.dataDir != "" {
+		dataDir := c.dataDir
 		go func() {
-			c.DataUsage = util.GetDirSize(c.DataDir)
+			size := util.GetDirSize(dataDir)
+			c.mu.Lock()
+			c.dataUsage = size
+			c.mu.Unlock()
 		}()
 	}
-	if c.WorkUsage == "" && c.WorkDir != "" {
+	if c.workUsage == "" && c.workDir != "" {
+		workDir := c.workDir
 		go func() {
-			workSize := util.GetDirSize(c.WorkDir)
+			workSize := util.GetDirSize(workDir)
 			cacheDir := filecopy.GetCacheDir()
 			cacheSize := util.GetDirSize(cacheDir)
-			c.WorkUsage = fmt.Sprintf("%s (Cache: %s)", workSize, cacheSize)
+			result := fmt.Sprintf("%s (Cache: %s)", workSize, cacheSize)
+			c.mu.Lock()
+			c.workUsage = result
+			c.mu.Unlock()
 		}()
 	}
 }
 
-func (c *Context) GetDataDir() string {
-	return c.DataDir
-}
-
-func (c *Context) GetWorkDir() string {
-	return c.WorkDir
-}
-
-func (c *Context) GetPlatform() string {
-	return c.Platform
-}
-
-func (c *Context) GetVersion() int {
-	return c.Version
-}
-
-func (c *Context) GetDataKey() string {
-	return c.DataKey
-}
-
-func (c *Context) GetWalEnabled() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.WalEnabled
-}
-
-func (c *Context) GetAutoDecryptDebounce() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.AutoDecryptDebounce
-}
-
-func (c *Context) GetHTTPAddr() string {
-	if c.HTTPAddr == "" {
-		c.HTTPAddr = DefalutHTTPAddr
-	}
-	return c.HTTPAddr
-}
-
-func (c *Context) GetWebhook() *conf.Webhook {
-	return c.conf.Webhook
-}
-
-func (c *Context) GetSaveDecryptedMedia() bool {
-	// Default to true for now, can be made configurable later
-	return true
-}
-
-// GetBackupPath 返回备份目录路径。优先使用环境变量 CHATLOG_BACKUP_PATH，其次读取配置文件。
-func (c *Context) GetBackupPath() string {
-	if v := os.Getenv("CHATLOG_BACKUP_PATH"); v != "" {
-		return v
-	}
-	return c.conf.BackupPath
-}
-
-func (c *Context) SetBackupPath(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conf.BackupPath == path {
-		return
-	}
-	c.conf.BackupPath = path
-	if err := c.cm.SetConfig("backup_path", path); err != nil {
-		log.Error().Err(err).Msg("set backup_path failed")
-	}
-}
-
-func (c *Context) SetHTTPEnabled(enabled bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.HTTPEnabled == enabled {
-		return
-	}
-	c.HTTPEnabled = enabled
-	c.UpdateConfig()
-}
-
-func (c *Context) SetHTTPAddr(addr string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.HTTPAddr == addr {
-		return
-	}
-	c.HTTPAddr = addr
-	c.UpdateConfig()
-}
-
-func (c *Context) SetWorkDir(dir string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.WorkDir == dir {
-		return
-	}
-	c.WorkDir = dir
-	c.UpdateConfig()
-	c.Refresh()
-}
-
-func (c *Context) SetDataDir(dir string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.DataDir == dir {
-		return
-	}
-	c.DataDir = dir
-	c.UpdateConfig()
-	c.Refresh()
-}
-
-func (c *Context) SetImgKey(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.ImgKey == key {
-		return
-	}
-	c.ImgKey = key
-	c.UpdateConfig()
-}
-
-func (c *Context) SetAutoDecrypt(enabled bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.AutoDecrypt == enabled {
-		return
-	}
-	c.AutoDecrypt = enabled
-	c.UpdateConfig()
-}
-
-func (c *Context) SetWalEnabled(enabled bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.WalEnabled == enabled {
-		return
-	}
-	c.WalEnabled = enabled
-	c.UpdateConfig()
-}
-
-func (c *Context) SetAutoDecryptDebounce(debounce int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.AutoDecryptDebounce == debounce {
-		return
-	}
-	c.AutoDecryptDebounce = debounce
-	c.UpdateConfig()
-}
-
-// 更新配置
-func (c *Context) UpdateConfig() {
+func (c *Context) updateConfig() {
 
 	pconf := conf.ProcessConfig{
-		Type:        "wechat",
-		Account:     c.Account,
-		Platform:    c.Platform,
-		Version:     c.Version,
-		FullVersion: c.FullVersion,
-		DataDir:     c.DataDir,
-		DataKey:     c.DataKey,
-		ImgKey:      c.ImgKey,
-		WorkDir:     c.WorkDir,
-		HTTPEnabled: c.HTTPEnabled,
-		HTTPAddr:    c.HTTPAddr,
-		WalEnabled:  c.WalEnabled,
-		AutoDecrypt: c.AutoDecrypt,
-		AutoDecryptDebounce: c.AutoDecryptDebounce,
+		Type:                "wechat",
+		Account:             c.account,
+		Platform:            c.platform,
+		Version:             c.version,
+		FullVersion:         c.fullVersion,
+		DataDir:             c.dataDir,
+		DataKey:             c.dataKey,
+		ImgKey:              c.imgKey,
+		WorkDir:             c.workDir,
+		HTTPEnabled:         c.httpEnabled,
+		HTTPAddr:            c.httpAddr,
+		WalEnabled:          c.walEnabled,
+		AutoDecrypt:         c.autoDecrypt,
+		AutoDecryptDebounce: c.autoDecryptDebounce,
 	}
 
 	if c.conf.History == nil {
@@ -348,7 +249,7 @@ func (c *Context) UpdateConfig() {
 	} else {
 		isFind := false
 		for i, v := range c.conf.History {
-			if v.Account == c.Account {
+			if v.Account == c.account {
 				isFind = true
 				c.conf.History[i] = pconf
 				break
@@ -359,7 +260,7 @@ func (c *Context) UpdateConfig() {
 		}
 	}
 
-	if err := c.cm.SetConfig("last_account", c.Account); err != nil {
+	if err := c.cm.SetConfig("last_account", c.account); err != nil {
 		log.Error().Err(err).Msg("set last_account failed")
 		return
 	}
@@ -375,5 +276,312 @@ func (c *Context) UpdateConfig() {
 				log.Error().Err(err).Msg("save chatlog.json failed")
 			}
 		}
+	}
+}
+
+// --- Getters (all RLock-protected) ---
+
+func (c *Context) GetAccount() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.account
+}
+
+func (c *Context) GetPlatform() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.platform
+}
+
+func (c *Context) GetVersion() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.version
+}
+
+func (c *Context) GetFullVersion() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.fullVersion
+}
+
+func (c *Context) GetDataDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dataDir
+}
+
+func (c *Context) GetDataKey() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dataKey
+}
+
+func (c *Context) GetDataUsage() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dataUsage
+}
+
+func (c *Context) GetImgKey() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.imgKey
+}
+
+func (c *Context) GetWorkDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.workDir
+}
+
+func (c *Context) GetWorkUsage() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.workUsage
+}
+
+func (c *Context) GetHTTPEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.httpEnabled
+}
+
+func (c *Context) GetHTTPAddr() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.httpAddr
+}
+
+func (c *Context) GetAutoDecrypt() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.autoDecrypt
+}
+
+func (c *Context) GetLastSession() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastSession
+}
+
+func (c *Context) GetWalEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.walEnabled
+}
+
+func (c *Context) GetAutoDecryptDebounce() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.autoDecryptDebounce
+}
+
+func (c *Context) GetPID() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pid
+}
+
+func (c *Context) GetExePath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.exePath
+}
+
+func (c *Context) GetStatus() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.status
+}
+
+// GetCurrent returns a shallow copy of the current wechat account, or nil.
+func (c *Context) GetCurrent() *wechat.Account {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.current == nil {
+		return nil
+	}
+	cp := *c.current
+	return &cp
+}
+
+// GetWeChatInstances returns a copy of the instances slice.
+func (c *Context) GetWeChatInstances() []*wechat.Account {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]*wechat.Account, len(c.weChatInstances))
+	copy(result, c.weChatInstances)
+	return result
+}
+
+// GetHistory returns a copy of the history map.
+func (c *Context) GetHistory() map[string]conf.ProcessConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make(map[string]conf.ProcessConfig, len(c.history))
+	for k, v := range c.history {
+		result[k] = v
+	}
+	return result
+}
+
+// GetSnapshot returns a read-only snapshot of all UI-visible fields in a single lock acquisition.
+func (c *Context) GetSnapshot() Snapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return Snapshot{
+		Account:             c.account,
+		PID:                 c.pid,
+		FullVersion:         c.fullVersion,
+		ExePath:             c.exePath,
+		Status:              c.status,
+		DataKey:             c.dataKey,
+		ImgKey:              c.imgKey,
+		Platform:            c.platform,
+		DataUsage:           c.dataUsage,
+		DataDir:             c.dataDir,
+		WorkUsage:           c.workUsage,
+		WorkDir:             c.workDir,
+		HTTPAddr:            c.httpAddr,
+		HTTPEnabled:         c.httpEnabled,
+		AutoDecrypt:         c.autoDecrypt,
+		AutoDecryptDebounce: c.autoDecryptDebounce,
+		WalEnabled:          c.walEnabled,
+		LastSession:         c.lastSession,
+	}
+}
+
+func (c *Context) GetWebhook() *conf.Webhook {
+	return c.conf.Webhook
+}
+
+func (c *Context) GetSaveDecryptedMedia() bool {
+	return true
+}
+
+// GetBackupPath returns the backup directory path. Prefers env var CHATLOG_BACKUP_PATH.
+func (c *Context) GetBackupPath() string {
+	if v := os.Getenv("CHATLOG_BACKUP_PATH"); v != "" {
+		return v
+	}
+	return c.conf.BackupPath
+}
+
+// --- Setters (all Lock-protected) ---
+
+func (c *Context) SetHTTPEnabled(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.httpEnabled == enabled {
+		return
+	}
+	c.httpEnabled = enabled
+	c.updateConfig()
+}
+
+func (c *Context) SetHTTPAddr(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.httpAddr == addr {
+		return
+	}
+	c.httpAddr = addr
+	c.updateConfig()
+}
+
+func (c *Context) SetWorkDir(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.workDir == dir {
+		return
+	}
+	c.workDir = dir
+	c.updateConfig()
+	c.refresh()
+}
+
+func (c *Context) SetDataDir(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dataDir == dir {
+		return
+	}
+	c.dataDir = dir
+	c.updateConfig()
+	c.refresh()
+}
+
+func (c *Context) SetDataKey(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dataKey == key {
+		return
+	}
+	c.dataKey = key
+	c.updateConfig()
+}
+
+func (c *Context) SetImgKey(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.imgKey == key {
+		return
+	}
+	c.imgKey = key
+	c.updateConfig()
+}
+
+func (c *Context) SetAutoDecrypt(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.autoDecrypt == enabled {
+		return
+	}
+	c.autoDecrypt = enabled
+	c.updateConfig()
+}
+
+func (c *Context) SetWalEnabled(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.walEnabled == enabled {
+		return
+	}
+	c.walEnabled = enabled
+	c.updateConfig()
+}
+
+func (c *Context) SetAutoDecryptDebounce(debounce int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.autoDecryptDebounce == debounce {
+		return
+	}
+	c.autoDecryptDebounce = debounce
+	c.updateConfig()
+}
+
+func (c *Context) SetLastSession(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastSession = t
+}
+
+func (c *Context) SetWeChatInstances(instances []*wechat.Account) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.weChatInstances = instances
+}
+
+func (c *Context) SetBackupPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conf.BackupPath == path {
+		return
+	}
+	c.conf.BackupPath = path
+	if err := c.cm.SetConfig("backup_path", path); err != nil {
+		log.Error().Err(err).Msg("set backup_path failed")
 	}
 }

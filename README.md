@@ -16,6 +16,14 @@
 
 ## 更新日志
 
+### 2026年4月16日
+- **TUI 渲染稳定性系统级修复**：
+  - **Context 并发安全重构**：将 `Context` 结构体的所有 public 字段改为 private，通过 mutex 保护的 getter/setter 方法访问，从编译层面杜绝未来代码引入数据竞态（data race）的可能。
+  - **Snapshot 机制**：新增 `GetSnapshot()` 方法，TUI 刷新循环通过一次加锁获取所有 UI 显示字段的快照，替代此前分散的字段访问。
+  - **内部方法拆分**：将 `SwitchHistory`、`Refresh`、`UpdateConfig` 拆分为加锁外壳和无锁内部方法，消除嵌套锁死锁风险。
+  - **stopRefresh 初始化**：修复 refresh goroutine 的停止通道未初始化导致无法正常退出的问题。
+  - **Draw 优化**：移除 Menu/SubMenu 的 `Draw()` 中每帧重建表格的冗余操作，降低 cmd.exe 下的渲染压力。
+
 ### 2026年1月25日
 - **CI/CD 优化**：
   - **工作流配置**：修改 GitHub Actions 配置，不再对 Markdown 文档 (`.md`) 的更改触发构建流程，节省 CI 资源。

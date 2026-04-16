@@ -115,8 +115,6 @@ func (m *Menu) refresh() {
 }
 
 func (m *Menu) Draw(screen tcell.Screen) {
-	m.refresh()
-
 	m.Box.DrawForSubclass(screen, m)
 	m.Box.SetBorder(false)
 

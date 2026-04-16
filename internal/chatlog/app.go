@@ -54,6 +54,7 @@ func NewApp(ctx *ctx.Context, m *Manager) *App {
 		footer:      footer.New(),
 		menu:        menu.New("主菜单"),
 		help:        help.New(),
+		stopRefresh: make(chan struct{}),
 	}
 
 	app.initMenu()
@@ -102,7 +103,7 @@ func (a *App) updateMenuItemsState() {
 	for _, item := range a.menu.GetItems() {
 		// 更新自动解密菜单项
 		if item.Index == 6 {
-			if a.ctx.AutoDecrypt {
+			if a.ctx.GetAutoDecrypt() {
 				item.Name = "停止自动解密"
 				item.Description = "停止监控数据目录更新，不再自动解密新增数据"
 			} else {
@@ -113,7 +114,7 @@ func (a *App) updateMenuItemsState() {
 
 		// 更新HTTP服务菜单项
 		if item.Index == 5 {
-			if a.ctx.HTTPEnabled {
+			if a.ctx.GetHTTPEnabled() {
 				item.Name = "停止 HTTP 服务"
 				item.Description = "停止本地 HTTP & MCP 服务器"
 			} else {
@@ -143,30 +144,33 @@ func (a *App) refresh() {
 			return
 		case <-tick.C:
 			var processErr error
+			current := a.ctx.GetCurrent()
+
 			// 如果当前账号为空，尝试查找微信进程
-			if a.ctx.Current == nil {
-				// 获取微信实例
+			if current == nil {
 				instances, err := a.m.wechat.GetWeChatInstancesWithError()
 				processErr = err
 				if err == nil && len(instances) > 0 {
-					// 找到微信进程，设置第一个为当前账号
 					a.ctx.SwitchCurrent(instances[0])
 					log.Info().Msgf("检测到微信进程，PID: %d，已设置为当前账号", instances[0].PID)
 				}
 			}
 
+			// 重新读取，因为 SwitchCurrent 可能已更新
+			current = a.ctx.GetCurrent()
+
 			// 刷新当前账号状态（如果存在）
-			if a.ctx.Current != nil {
-				originalName := a.ctx.Current.Name
-				a.ctx.Current.RefreshStatus()
-				if a.ctx.Current.Name != originalName {
-					a.ctx.SwitchCurrent(a.ctx.Current)
+			if current != nil {
+				originalName := current.Name
+				current.RefreshStatus()
+				if current.Name != originalName {
+					a.ctx.SwitchCurrent(current)
 				} else {
 					a.ctx.Refresh()
 				}
 			}
 
-			if a.ctx.AutoDecrypt || a.ctx.HTTPEnabled {
+			if a.ctx.GetAutoDecrypt() || a.ctx.GetHTTPEnabled() {
 				a.m.RefreshSession()
 			}
 
@@ -181,41 +185,53 @@ func (a *App) refresh() {
 				latestContent = session.Content
 			}
 
+			// 一次加锁获取所有 UI 显示字段的快照
+			snap := a.ctx.GetSnapshot()
+
+			statusText := snap.Status
+			if snap.PID == 0 && processErr != nil {
+				statusText = fmt.Sprintf("[red]获取进程失败: %v[white]", processErr)
+			}
+
+			httpServerText := "[未启动]"
+			if snap.HTTPEnabled {
+				httpServerText = fmt.Sprintf("[green][已启动][white] [%s]", snap.HTTPAddr)
+			}
+
+			autoDecryptText := "[未开启]"
+			if snap.AutoDecrypt {
+				if snap.AutoDecryptDebounce > 0 {
+					autoDecryptText = fmt.Sprintf("[green][已开启][white] %dms", snap.AutoDecryptDebounce)
+				} else {
+					autoDecryptText = "[green][已开启][white]"
+				}
+			}
+
+			walText := "[未启用]"
+			if snap.WalEnabled {
+				walText = "[green][已启用][white]"
+			}
+
+			sessionText := ""
+			if snap.LastSession.Unix() > 1000000000 {
+				sessionText = snap.LastSession.Format("2006-01-02 15:04:05")
+			}
+
 			a.QueueUpdateDraw(func() {
-				a.infoBar.UpdateAccount(a.ctx.Account)
-				a.infoBar.UpdateBasicInfo(a.ctx.PID, a.ctx.FullVersion, a.ctx.ExePath)
-				statusText := a.ctx.Status
-				if a.ctx.PID == 0 && processErr != nil {
-					statusText = fmt.Sprintf("[red]获取进程失败: %v[white]", processErr)
-				}
+				a.infoBar.UpdateAccount(snap.Account)
+				a.infoBar.UpdateBasicInfo(snap.PID, snap.FullVersion, snap.ExePath)
 				a.infoBar.UpdateStatus(statusText)
-				a.infoBar.UpdateDataKey(a.ctx.DataKey)
-				a.infoBar.UpdateImageKey(a.ctx.ImgKey)
-				a.infoBar.UpdatePlatform(a.ctx.Platform)
-				a.infoBar.UpdateDataUsageDir(a.ctx.DataUsage, a.ctx.DataDir)
-				a.infoBar.UpdateWorkUsageDir(a.ctx.WorkUsage, a.ctx.WorkDir)
-				if a.ctx.LastSession.Unix() > 1000000000 {
-					a.infoBar.UpdateSession(a.ctx.LastSession.Format("2006-01-02 15:04:05"))
+				a.infoBar.UpdateDataKey(snap.DataKey)
+				a.infoBar.UpdateImageKey(snap.ImgKey)
+				a.infoBar.UpdatePlatform(snap.Platform)
+				a.infoBar.UpdateDataUsageDir(snap.DataUsage, snap.DataDir)
+				a.infoBar.UpdateWorkUsageDir(snap.WorkUsage, snap.WorkDir)
+				if sessionText != "" {
+					a.infoBar.UpdateSession(sessionText)
 				}
-				if a.ctx.HTTPEnabled {
-					a.infoBar.UpdateHTTPServer(fmt.Sprintf("[green][已启动][white] [%s]", a.ctx.HTTPAddr))
-				} else {
-					a.infoBar.UpdateHTTPServer("[未启动]")
-				}
-				autoDecryptText := "[未开启]"
-				if a.ctx.AutoDecrypt {
-					if a.ctx.AutoDecryptDebounce > 0 {
-						autoDecryptText = fmt.Sprintf("[green][已开启][white] %dms", a.ctx.AutoDecryptDebounce)
-					} else {
-						autoDecryptText = "[green][已开启][white]"
-					}
-				}
+				a.infoBar.UpdateHTTPServer(httpServerText)
 				a.infoBar.UpdateAutoDecrypt(autoDecryptText)
-				if a.ctx.WalEnabled {
-					a.infoBar.UpdateWal("[green][已启用][white]")
-				} else {
-					a.infoBar.UpdateWal("[未启用]")
-				}
+				a.infoBar.UpdateWal(walText)
 
 				if latestSender != "" {
 					a.footer.UpdateLatestMessage(latestSender, latestTime, latestContent)
@@ -370,7 +386,7 @@ func (a *App) initMenu() {
 			modal := tview.NewModal()
 
 			// 根据当前服务状态执行不同操作
-			if !a.ctx.HTTPEnabled {
+			if !a.ctx.GetHTTPEnabled() {
 				// HTTP 服务未启动，启动服务
 				modal.SetText("正在启动 HTTP 服务...")
 				a.mainPages.AddPage("modal", modal, true, true)
@@ -444,7 +460,7 @@ func (a *App) initMenu() {
 			modal := tview.NewModal()
 
 			// 根据当前自动解密状态执行不同操作
-			if !a.ctx.AutoDecrypt {
+			if !a.ctx.GetAutoDecrypt() {
 				// 自动解密未开启，开启自动解密
 				modal.SetText("正在开启自动解密...")
 				a.mainPages.AddPage("modal", modal, true, true)
@@ -619,7 +635,7 @@ func (a *App) settingHTTPPort() {
 	formView := form.NewForm("设置 HTTP 地址")
 
 	// 临时存储用户输入的值
-	tempHTTPAddr := a.ctx.HTTPAddr
+	tempHTTPAddr := a.ctx.GetHTTPAddr()
 
 	// 添加输入字段 - 不再直接设置HTTP地址，而是更新临时变量
 	formView.AddInputField("地址", tempHTTPAddr, 0, nil, func(text string) {
@@ -630,7 +646,7 @@ func (a *App) settingHTTPPort() {
 	formView.AddButton("保存", func() {
 		a.m.SetHTTPAddr(tempHTTPAddr) // 在这里设置HTTP地址
 		a.mainPages.RemovePage("submenu2")
-		a.showInfo("HTTP 地址已设置为 " + a.ctx.HTTPAddr)
+		a.showInfo("HTTP 地址已设置为 " + a.ctx.GetHTTPAddr())
 	})
 
 	formView.AddButton("取消", func() {
@@ -647,7 +663,7 @@ func (a *App) settingWorkDir() {
 	formView := form.NewForm("设置工作目录")
 
 	// 临时存储用户输入的值
-	tempWorkDir := a.ctx.WorkDir
+	tempWorkDir := a.ctx.GetWorkDir()
 
 	// 添加输入字段 - 不再直接设置工作目录，而是更新临时变量
 	formView.AddInputField("工作目录", tempWorkDir, 0, nil, func(text string) {
@@ -658,7 +674,7 @@ func (a *App) settingWorkDir() {
 	formView.AddButton("保存", func() {
 		a.ctx.SetWorkDir(tempWorkDir) // 在这里设置工作目录
 		a.mainPages.RemovePage("submenu2")
-		a.showInfo("工作目录已设置为 " + a.ctx.WorkDir)
+		a.showInfo("工作目录已设置为 " + a.ctx.GetWorkDir())
 	})
 
 	formView.AddButton("取消", func() {
@@ -675,7 +691,7 @@ func (a *App) settingDataKey() {
 	formView := form.NewForm("设置数据密钥")
 
 	// 临时存储用户输入的值
-	tempDataKey := a.ctx.DataKey
+	tempDataKey := a.ctx.GetDataKey()
 
 	// 添加输入字段 - 不直接设置数据密钥，而是更新临时变量
 	formView.AddInputField("数据密钥", tempDataKey, 0, nil, func(text string) {
@@ -684,7 +700,7 @@ func (a *App) settingDataKey() {
 
 	// 添加按钮 - 点击保存时才设置数据密钥
 	formView.AddButton("保存", func() {
-		a.ctx.DataKey = tempDataKey // 设置数据密钥
+		a.ctx.SetDataKey(tempDataKey)
 		a.mainPages.RemovePage("submenu2")
 		a.showInfo("数据密钥已设置")
 	})
@@ -701,7 +717,7 @@ func (a *App) settingDataKey() {
 func (a *App) settingImgKey() {
 	formView := form.NewForm("设置图片密钥")
 
-	tempImgKey := a.ctx.ImgKey
+	tempImgKey := a.ctx.GetImgKey()
 
 	formView.AddInputField("图片密钥", tempImgKey, 0, nil, func(text string) {
 		tempImgKey = text
@@ -727,7 +743,7 @@ func (a *App) settingDataDir() {
 	formView := form.NewForm("设置数据目录")
 
 	// 临时存储用户输入的值
-	tempDataDir := a.ctx.DataDir
+	tempDataDir := a.ctx.GetDataDir()
 
 	// 添加输入字段 - 不直接设置数据目录，而是更新临时变量
 	formView.AddInputField("数据目录", tempDataDir, 0, nil, func(text string) {
@@ -736,9 +752,9 @@ func (a *App) settingDataDir() {
 
 	// 添加按钮 - 点击保存时才设置数据目录
 	formView.AddButton("保存", func() {
-		a.ctx.DataDir = tempDataDir // 设置数据目录
+		a.ctx.SetDataDir(tempDataDir)
 		a.mainPages.RemovePage("submenu2")
-		a.showInfo("数据目录已设置为 " + a.ctx.DataDir)
+		a.showInfo("数据目录已设置为 " + a.ctx.GetDataDir())
 	})
 
 	formView.AddButton("取消", func() {
@@ -752,7 +768,7 @@ func (a *App) settingDataDir() {
 func (a *App) settingWalEnabled() {
 	formView := form.NewForm("设置 WAL 支持")
 
-	tempWalEnabled := a.ctx.WalEnabled
+	tempWalEnabled := a.ctx.GetWalEnabled()
 
 	formView.AddCheckbox("启用 WAL 支持", tempWalEnabled, func(checked bool) {
 		tempWalEnabled = checked
@@ -780,8 +796,8 @@ func (a *App) settingAutoDecryptDebounce() {
 	formView := form.NewForm("设置自动解密去抖")
 
 	tempDebounceText := ""
-	if a.ctx.AutoDecryptDebounce > 0 {
-		tempDebounceText = strconv.Itoa(a.ctx.AutoDecryptDebounce)
+	if a.ctx.GetAutoDecryptDebounce() > 0 {
+		tempDebounceText = strconv.Itoa(a.ctx.GetAutoDecryptDebounce())
 	}
 
 	formView.AddInputField("去抖时长(ms)", tempDebounceText, 0, func(textToCheck string, lastChar rune) bool {
@@ -874,7 +890,8 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 
 			// 标记当前选中的实例
 			name := fmt.Sprintf("%s [%d]", instance.Name, instance.PID)
-			if a.ctx.Current != nil && a.ctx.Current.PID == instance.PID {
+			cur := a.ctx.GetCurrent()
+			if cur != nil && cur.PID == instance.PID {
 				name = name + " [当前]"
 			}
 
@@ -887,7 +904,8 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 				Selected: func(instance *wechat.Account) func(*menu.Item) {
 					return func(*menu.Item) {
 						// 如果是当前账号，则无需切换
-						if a.ctx.Current != nil && a.ctx.Current.PID == instance.PID {
+						cur := a.ctx.GetCurrent()
+						if cur != nil && cur.PID == instance.PID {
 							a.mainPages.RemovePage("submenu")
 							a.showInfo("已经是当前账号")
 							return
@@ -926,7 +944,8 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 	}
 
 	// 添加历史账号
-	if len(a.ctx.History) > 0 {
+	histories := a.ctx.GetHistory()
+	if len(histories) > 0 {
 		// 添加历史账号标题
 		subMenu.AddItem(&menu.Item{
 			Index:       100,
@@ -938,7 +957,7 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 
 		// 添加历史账号列表
 		idx := 101
-		for account, hist := range a.ctx.History {
+		for account, hist := range histories {
 			// 创建一个账号描述
 			description := fmt.Sprintf("版本: %s 目录: %s", hist.FullVersion, hist.DataDir)
 
@@ -947,7 +966,7 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 			if name == "" {
 				name = filepath.Base(hist.DataDir)
 			}
-			if a.ctx.DataDir == hist.DataDir {
+			if a.ctx.GetDataDir() == hist.DataDir {
 				name = name + " [当前]"
 			}
 
@@ -960,7 +979,9 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 				Selected: func(account string) func(*menu.Item) {
 					return func(*menu.Item) {
 						// 如果是当前账号，则无需切换
-						if a.ctx.Current != nil && a.ctx.DataDir == a.ctx.History[account].DataDir {
+						cur := a.ctx.GetCurrent()
+						histMap := a.ctx.GetHistory()
+						if cur != nil && a.ctx.GetDataDir() == histMap[account].DataDir {
 							a.mainPages.RemovePage("submenu")
 							a.showInfo("已经是当前账号")
 							return
@@ -1000,7 +1021,7 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 	}
 
 	// 如果没有账号可选择
-	if len(a.ctx.History) == 0 && len(instances) == 0 {
+	if len(histories) == 0 && len(instances) == 0 {
 		subMenu.AddItem(&menu.Item{
 			Index:       1,
 			Name:        "无可用账号",
