@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"os"
 
 	"github.com/sjzar/chatlog/internal/errors"
+	"github.com/sjzar/chatlog/pkg/util"
 )
 
 const (
@@ -30,7 +30,7 @@ type DBFile struct {
 }
 
 func OpenDBFile(dbPath string, pageSize int) (*DBFile, error) {
-	fp, err := os.Open(dbPath)
+	fp, err := util.OpenFileShared(dbPath)
 	if err != nil {
 		return nil, errors.OpenFileFailed(dbPath, err)
 	}

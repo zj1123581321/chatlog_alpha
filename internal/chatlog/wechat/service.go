@@ -38,6 +38,7 @@ type Service struct {
 	mutex          sync.Mutex
 	fm             *filemonitor.FileMonitor
 	errorHandler   func(error)
+	decryptSem     chan struct{}
 }
 
 type pendingEvent struct {
@@ -73,6 +74,32 @@ func NewService(conf Config) *Service {
 		pendingActions: make(map[string]bool),
 		pendingEvents:  make(map[string]*pendingEvent),
 		walStates:      make(map[string]*walState),
+		decryptSem:     make(chan struct{}, 1),
+	}
+}
+
+// acquireDecryptSlot blocks until a decrypt slot is available.
+// Limits concurrent decryption to 1 to minimize IO contention with WeChat.
+func (s *Service) acquireDecryptSlot() {
+	s.decryptSem <- struct{}{}
+}
+
+func (s *Service) releaseDecryptSlot() {
+	<-s.decryptSem
+}
+
+// handleDecryptError routes errors: file lock errors are logged and skipped,
+// other errors trigger the circuit-breaker errorHandler.
+func (s *Service) handleDecryptError(err error) {
+	if err == nil {
+		return
+	}
+	if util.IsFileLockError(err) {
+		log.Warn().Err(err).Msg("文件被微信占用，跳过本次解密")
+		return
+	}
+	if s.errorHandler != nil {
+		s.errorHandler(err)
 	}
 }
 
@@ -186,6 +213,11 @@ func (s *Service) DecryptFileCallback(event fsnotify.Event) error {
 	return nil
 }
 
+const (
+	decryptRetryAttempts  = 5
+	decryptRetryBaseDelay = 5 * time.Second
+)
+
 func (s *Service) waitAndProcess(dbFile string) {
 	start := time.Now()
 	for {
@@ -210,6 +242,11 @@ func (s *Service) waitAndProcess(dbFile string) {
 			if _, err := os.Stat(dbFile); err != nil {
 				return
 			}
+
+			// 获取解密槽位，同一时刻只允许 1 个解密任务，降低 IO 争抢
+			s.acquireDecryptSlot()
+			defer s.releaseDecryptSlot()
+
 			log.Debug().Msgf("Processing file: %s", dbFile)
 			workCopyExists := false
 			if s.conf.GetWorkDir() != "" {
@@ -223,11 +260,11 @@ func (s *Service) waitAndProcess(dbFile string) {
 			if flags.sawDB {
 				if flags.sawWal && workCopyExists {
 					// Both DB and WAL changed, try incremental first
-					handled, err := s.IncrementalDecryptDBFile(dbFile)
+					handled, err := s.retryDecrypt(func() (bool, error) {
+						return s.IncrementalDecryptDBFile(dbFile)
+					})
 					if err != nil {
-						if s.errorHandler != nil {
-							s.errorHandler(err)
-						}
+						s.handleDecryptError(err)
 						return
 					}
 					if handled {
@@ -235,44 +272,58 @@ func (s *Service) waitAndProcess(dbFile string) {
 					}
 				}
 				// Full re-decrypt: new file, checkpoint update, or incremental failed
-				if err := s.DecryptDBFile(dbFile); err != nil {
-					if s.errorHandler != nil {
-						s.errorHandler(err)
-					}
+				err := retryOnFileLock(func() error {
+					return s.DecryptDBFile(dbFile)
+				}, decryptRetryAttempts, decryptRetryBaseDelay)
+				if err != nil {
+					s.handleDecryptError(err)
 				}
 				return
 			}
 			if flags.sawWal {
-				handled, err := s.IncrementalDecryptDBFile(dbFile)
+				handled, err := s.retryDecrypt(func() (bool, error) {
+					return s.IncrementalDecryptDBFile(dbFile)
+				})
 				if err != nil {
-					if s.errorHandler != nil {
-						s.errorHandler(err)
-					}
+					s.handleDecryptError(err)
 					return
 				}
 				if handled {
 					return
 				}
 				if !workCopyExists {
-					if err := s.DecryptDBFile(dbFile); err != nil {
-						if s.errorHandler != nil {
-							s.errorHandler(err)
-						}
+					err := retryOnFileLock(func() error {
+						return s.DecryptDBFile(dbFile)
+					}, decryptRetryAttempts, decryptRetryBaseDelay)
+					if err != nil {
+						s.handleDecryptError(err)
 					}
 				}
 				return
 			}
 			if !s.conf.GetWalEnabled() || !workCopyExists {
-				if err := s.DecryptDBFile(dbFile); err != nil {
-					if s.errorHandler != nil {
-						s.errorHandler(err)
-					}
+				err := retryOnFileLock(func() error {
+					return s.DecryptDBFile(dbFile)
+				}, decryptRetryAttempts, decryptRetryBaseDelay)
+				if err != nil {
+					s.handleDecryptError(err)
 				}
 			}
 			return
 		}
 		s.mutex.Unlock()
 	}
+}
+
+// retryDecrypt wraps IncrementalDecryptDBFile-style functions with file lock retry.
+func (s *Service) retryDecrypt(op func() (bool, error)) (bool, error) {
+	var handled bool
+	err := retryOnFileLock(func() error {
+		var e error
+		handled, e = op()
+		return e
+	}, decryptRetryAttempts, decryptRetryBaseDelay)
+	return handled, err
 }
 
 func (s *Service) DecryptDBFile(dbFile string) error {
@@ -305,7 +356,7 @@ func (s *Service) DecryptDBFile(dbFile string) error {
 
 	if err := decryptor.Decrypt(context.Background(), dbFile, s.conf.GetDataKey(), outputFile); err != nil {
 		if err == errors.ErrAlreadyDecrypted {
-			if data, err := os.ReadFile(dbFile); err == nil {
+			if data, err := util.ReadFileShared(dbFile); err == nil {
 				outputFile.Write(data)
 			}
 			if s.conf.GetWalEnabled() {
@@ -507,7 +558,7 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 		return true, err
 	}
 
-	walFile, err := os.Open(walPath)
+	walFile, err := util.OpenFileShared(walPath)
 	if err != nil {
 		return true, err
 	}

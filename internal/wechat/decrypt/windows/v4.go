@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"hash"
 	"io"
-	"os"
 
 	"github.com/sjzar/chatlog/internal/errors"
 	"github.com/sjzar/chatlog/internal/wechat/decrypt/common"
+	"github.com/sjzar/chatlog/pkg/util"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -105,8 +105,8 @@ func (d *V4Decryptor) Decrypt(ctx context.Context, dbfile string, hexKey string,
 	// 计算密钥
 	encKey, macKey := d.deriveKeys(key, dbInfo.Salt)
 
-	// 打开数据库文件
-	dbFile, err := os.Open(dbfile)
+	// 打开数据库文件（共享模式，不阻塞微信写入）
+	dbFile, err := util.OpenFileShared(dbfile)
 	if err != nil {
 		return errors.OpenFileFailed(dbfile, err)
 	}
