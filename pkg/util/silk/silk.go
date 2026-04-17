@@ -7,7 +7,15 @@ import (
 	"github.com/sjzar/go-silk"
 )
 
-func Silk2MP3(data []byte) ([]byte, error) {
+func Silk2MP3(data []byte) (out []byte, err error) {
+	// CGO 层遇到非标准 silk 数据时可能 nil deref；包一层 recover 降级为普通错误，
+	// 让上层 handler 走"返回原始字节"的 fallback，而不是整个请求 500。
+	defer func() {
+		if r := recover(); r != nil {
+			out = nil
+			err = fmt.Errorf("silk2mp3 panicked: %v", r)
+		}
+	}()
 
 	sd := silk.SilkInit()
 	defer sd.Close()

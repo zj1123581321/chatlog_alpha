@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"embed"
 	"encoding/csv"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog/log"
@@ -54,6 +56,8 @@ func (s *Service) initMediaRouter() {
 	s.router.GET("/video/*key", func(c *gin.Context) { s.handleMedia(c, "video") })
 	s.router.GET("/file/*key", func(c *gin.Context) { s.handleMedia(c, "file") })
 	s.router.GET("/voice/*key", func(c *gin.Context) { s.handleMedia(c, "voice") })
+	// HEAD 走同一个 handler，避免被 NoRoute 302 到 /；<audio> 依赖 HEAD 拿 Content-Length
+	s.router.HEAD("/voice/*key", func(c *gin.Context) { s.handleMedia(c, "voice") })
 	s.router.GET("/data/*path", s.handleMediaData)
 }
 
@@ -827,10 +831,18 @@ func (s *Service) HandleDatFile(c *gin.Context, path string) {
 func (s *Service) HandleVoice(c *gin.Context, data []byte) {
 	out, err := silk.Silk2MP3(data)
 	if err != nil {
-		c.Data(http.StatusOK, "audio/silk", data)
+		serveAudioBytes(c, "audio/silk", data)
 		return
 	}
-	c.Data(http.StatusOK, "audio/mp3", out)
+	serveAudioBytes(c, "audio/mp3", out)
+}
+
+// serveAudioBytes 把音频字节写入响应，交由 http.ServeContent 负责
+// Content-Length、Accept-Ranges、Range 请求（206）以及 HEAD 无 body 的处理，
+// 从而让浏览器 <audio> 标签能显示时长并支持拖动进度条。
+func serveAudioBytes(c *gin.Context, contentType string, content []byte) {
+	c.Header("Content-Type", contentType)
+	http.ServeContent(c.Writer, c.Request, "", time.Time{}, bytes.NewReader(content))
 }
 
 // saveDecryptedFile saves the decrypted media file to local disk
