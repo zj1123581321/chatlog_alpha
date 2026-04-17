@@ -25,8 +25,14 @@ import (
 )
 
 var (
-	DebounceTime = 1 * time.Second
-	MaxWaitTime  = 10 * time.Second
+	// DebounceTime 是微信需要连续安静多久 chatlog 才开始解密。
+	// 默认 60 秒，让打开图片/收发消息等日常活动完全不会触发 chatlog 抢 IO。
+	// 用户可通过 AutoDecryptDebounce 配置覆盖。
+	DebounceTime = 60 * time.Second
+
+	// MaxWaitTime 是即使微信从未真正安静，也至少隔多久强制跑一次的兜底。
+	// 默认 10 分钟：即使用户持续活跃，chatlog 每 10 分钟至少追平一次。
+	MaxWaitTime = 10 * time.Minute
 )
 
 type Service struct {
@@ -145,7 +151,11 @@ func (s *Service) GetImageKey(info *wechat.Account) (string, error) {
 }
 
 func (s *Service) StartAutoDecrypt() error {
-	log.Info().Msgf("start auto decrypt, data dir: %s", s.conf.GetDataDir())
+	log.Info().
+		Str("data_dir", s.conf.GetDataDir()).
+		Dur("quiet_period", s.getDebounceTime()).
+		Dur("max_wait", s.getMaxWaitTime()).
+		Msg("自动解密已启用：微信安静期达到后处理变更，最长兜底强制处理")
 	// Always monitor WAL files since WeChat uses WAL mode regardless of our setting.
 	// When WalEnabled is false, WAL changes still trigger a full re-decrypt of the main .db file.
 	pattern := `.*\.db(-wal|-shm)?$`
@@ -231,6 +241,14 @@ func (s *Service) waitAndProcess(dbFile string) {
 		totalElapsed := time.Since(start)
 
 		if elapsed >= debounce || totalElapsed >= maxWait {
+			// 如果是 maxWait 兜底触发（而非安静期达到），说明微信长期活跃，记录警告
+			if elapsed < debounce && totalElapsed >= maxWait {
+				log.Warn().
+					Dur("total_elapsed", totalElapsed).
+					Dur("max_wait", maxWait).
+					Str("file", dbFile).
+					Msg("微信持续活跃超过 maxWait，强制处理积压的文件变更（可能短暂争抢 IO）")
+			}
 			s.pendingActions[dbFile] = false
 			flags := pendingEvent{}
 			if state, ok := s.pendingEvents[dbFile]; ok && state != nil {
@@ -398,55 +416,23 @@ func (s *Service) getDebounceTime() time.Duration {
 	return time.Duration(debounce) * time.Millisecond
 }
 
+// getMaxWaitTime 返回"即使微信从未安静也至少隔多久强制跑一次"的兜底时长。
+// 统一回退到 MaxWaitTime 默认值；不再针对 WAL 模式做 3 秒硬上限。
 func (s *Service) getMaxWaitTime() time.Duration {
-	if !s.conf.GetWalEnabled() {
-		return MaxWaitTime
-	}
-	debounce := s.getDebounceTime()
-	maxWait := 2 * debounce
-	if maxWait < time.Second {
-		return time.Second
-	}
-	if maxWait > 3*time.Second {
-		return 3 * time.Second
-	}
-	return maxWait
+	return MaxWaitTime
 }
 
+// getDebounceTimeForFile 返回指定 DB 文件的 debounce 时长。
+// 所有 DB 文件统一使用配置值，不再针对 message_*.db / session.db 等
+// "实时 DB" 做 300ms 特殊加速——在后台长期运行场景下，加速反而会抢微信 IO。
 func (s *Service) getDebounceTimeForFile(dbFile string) time.Duration {
-	debounce := s.getDebounceTime()
-	if !s.conf.GetWalEnabled() {
-		return debounce
-	}
-	if isRealtimeDBFile(dbFile) {
-		if debounce > 300*time.Millisecond {
-			return 300 * time.Millisecond
-		}
-	}
-	return debounce
+	return s.getDebounceTime()
 }
 
+// getMaxWaitTimeForFile 返回指定 DB 文件的 maxWait 时长。
+// 所有 DB 文件统一使用 MaxWaitTime；不再对实时 DB 做 1 秒特殊上限。
 func (s *Service) getMaxWaitTimeForFile(dbFile string) time.Duration {
-	if !s.conf.GetWalEnabled() {
-		return s.getMaxWaitTime()
-	}
-	if isRealtimeDBFile(dbFile) {
-		debounce := s.getDebounceTimeForFile(dbFile)
-		maxWait := 2 * debounce
-		if maxWait > time.Second {
-			return time.Second
-		}
-		return maxWait
-	}
 	return s.getMaxWaitTime()
-}
-
-func isRealtimeDBFile(dbFile string) bool {
-	base := filepath.Base(dbFile)
-	if base == "session.db" {
-		return true
-	}
-	return strings.HasPrefix(base, "message_") && strings.HasSuffix(base, ".db")
 }
 
 func (s *Service) normalizeDBFile(path string) string {
