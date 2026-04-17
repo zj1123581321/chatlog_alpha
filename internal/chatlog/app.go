@@ -465,13 +465,17 @@ func (a *App) initMenu() {
 				modal.SetText("正在开启自动解密...")
 				a.mainPages.AddPage("modal", modal, true, true)
 				a.SetFocus(modal)
+				log.Info().Msg("[autodecrypt] modal 已弹出，启动后台 goroutine")
 
 				// 在后台开启自动解密
 				go func() {
+					log.Info().Msg("[autodecrypt] goroutine 启动，调用 Manager.StartAutoDecrypt")
 					err := a.m.StartAutoDecrypt()
+					log.Info().Err(err).Msg("[autodecrypt] Manager.StartAutoDecrypt 返回，准备 QueueUpdateDraw")
 
 					// 在主线程中更新UI
 					a.QueueUpdateDraw(func() {
+						log.Info().Msg("[autodecrypt] UI 回调开始执行（主线程）")
 						if err != nil {
 							// 开启失败
 							modal.SetText("开启自动解密失败: " + err.Error())
@@ -479,9 +483,11 @@ func (a *App) initMenu() {
 							// 开启成功
 							modal.SetText("已开启自动解密")
 						}
+						log.Info().Msg("[autodecrypt] modal.SetText 完成，调用 updateMenuItemsState")
 
 						// 更改菜单项名称
 						a.updateMenuItemsState()
+						log.Info().Msg("[autodecrypt] updateMenuItemsState 完成，准备 AddButtons/SetDoneFunc/SetFocus")
 
 						// 添加确认按钮
 						modal.AddButtons([]string{"OK"})
@@ -489,7 +495,9 @@ func (a *App) initMenu() {
 							a.mainPages.RemovePage("modal")
 						})
 						a.SetFocus(modal)
+						log.Info().Msg("[autodecrypt] UI 回调执行完成（modal 应可关闭）")
 					})
+					log.Info().Msg("[autodecrypt] QueueUpdateDraw 已入队，goroutine 退出")
 				}()
 			} else {
 				// 自动解密已开启，停止自动解密

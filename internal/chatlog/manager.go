@@ -367,16 +367,23 @@ func (m *Manager) DecryptDBFiles() error {
 
 // StartAutoDecrypt 开启自动解密。
 // skipPrecheck 为 true 时跳过全量预检解密（用于启动恢复场景，依赖熔断机制兜底）。
-func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) error {
+func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) (retErr error) {
+	log.Info().Bool("skip_precheck", len(skipPrecheck) > 0 && skipPrecheck[0]).Msg("[autodecrypt] Manager.StartAutoDecrypt 入口")
+	defer func() {
+		log.Info().Err(retErr).Msg("[autodecrypt] Manager.StartAutoDecrypt 返回")
+	}()
+
 	if m.ctx.GetDataKey() == "" || m.ctx.GetDataDir() == "" {
 		return fmt.Errorf("请先获取密钥")
 	}
 
 	if len(skipPrecheck) == 0 || !skipPrecheck[0] {
 		// 首次开启：尝试运行一次解密，验证环境和密钥是否正常
+		log.Info().Msg("[autodecrypt] 开始全量预检 DecryptDBFiles")
 		if err := m.DecryptDBFiles(); err != nil {
 			return fmt.Errorf("初始解密失败，无法开启自动解密: %w", err)
 		}
+		log.Info().Msg("[autodecrypt] DecryptDBFiles 完成")
 	}
 
 	if m.ctx.GetWorkDir() == "" {
@@ -395,11 +402,14 @@ func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) error {
 		}
 	})
 
+	log.Info().Msg("[autodecrypt] 调用 wechat.StartAutoDecrypt（启动文件监控）")
 	if err := m.wechat.StartAutoDecrypt(); err != nil {
 		return err
 	}
+	log.Info().Msg("[autodecrypt] wechat.StartAutoDecrypt 返回，准备 ctx.SetAutoDecrypt(true)")
 
 	m.ctx.SetAutoDecrypt(true)
+	log.Info().Msg("[autodecrypt] ctx.SetAutoDecrypt(true) 完成（config 已持久化）")
 	return nil
 }
 
