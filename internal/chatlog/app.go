@@ -8,6 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/sjzar/chatlog/internal/chatlog/ctx"
+	httppkg "github.com/sjzar/chatlog/internal/chatlog/http"
 	"github.com/sjzar/chatlog/internal/ui/footer"
 	"github.com/sjzar/chatlog/internal/ui/form"
 	"github.com/sjzar/chatlog/internal/ui/help"
@@ -852,7 +853,17 @@ func (a *App) settingBackupPath() {
 
 	tempBackupPath := a.ctx.GetBackupPath()
 
-	formView.AddInputField("备份目录", tempBackupPath, 0, nil, func(text string) {
+	// 打开表单时扫一遍当前 backup 目录, 把识别结果作为输入框的 label 显示出来,
+	// 让用户一眼看到是否需要补配 BackupFolderMap。
+	label := "备份目录"
+	if tempBackupPath != "" {
+		idx := httppkg.NewBackupIndex(tempBackupPath, a.ctx.GetBackupFolderMap())
+		_ = idx.Scan()
+		chat, hex, unk := idx.Stats()
+		label = fmt.Sprintf("备份目录 [已识别 自动=%d 配置=%d 未知=%d]", chat, hex, unk)
+	}
+
+	formView.AddInputField(label, tempBackupPath, 0, nil, func(text string) {
 		tempBackupPath = text
 	})
 
@@ -862,7 +873,11 @@ func (a *App) settingBackupPath() {
 		if tempBackupPath == "" {
 			a.showInfo("备份目录已清除")
 		} else {
-			a.showInfo("备份目录已设置为 " + tempBackupPath)
+			idx := httppkg.NewBackupIndex(tempBackupPath, a.ctx.GetBackupFolderMap())
+			_ = idx.Scan()
+			chat, hex, unk := idx.Stats()
+			a.showInfo(fmt.Sprintf("备份目录已设置为 %s (自动识别 %d 群 / 配置映射 %d 群 / 未知 %d)",
+				tempBackupPath, chat, hex, unk))
 		}
 	})
 
