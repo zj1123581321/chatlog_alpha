@@ -35,9 +35,11 @@ func TestGetOrProbe_CacheHitSkipsProbe(t *testing.T) {
 	}
 }
 
-// TestGetOrProbe_DataDirEmptyBypassesCache 验证: DataDir 为空（未登录微信）
-// 每次都应重新探测，等微信登录拿到路径。
-func TestGetOrProbe_DataDirEmptyBypassesCache(t *testing.T) {
+// TestGetOrProbe_EmptyDataDirCachedShortTTL 验证: DataDir 为空也缓存，但 TTL 较短。
+// 主犯现场 (Weixin 主进程不持续持 session.db、子进程根本没 db_storage 路径)
+// 让首轮探测得到的 DataDir 一直是空，如果这种情况不缓存就会每秒命中 gopsutil
+// OpenFilesWithContext 的 HANDLE 泄漏 bug。
+func TestGetOrProbe_EmptyDataDirCachedShortTTL(t *testing.T) {
 	d := NewDetector()
 	var probeCount int
 
@@ -46,14 +48,35 @@ func TestGetOrProbe_DataDirEmptyBypassesCache(t *testing.T) {
 		return &model.Process{PID: 1234, DataDir: ""}, nil
 	}
 
+	// 短 TTL 内连续 5 次调用应只 probe 1 次
 	for i := 0; i < 5; i++ {
 		if _, err := d.getOrProbe(1234, probe); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
+	if probeCount != 1 {
+		t.Errorf("empty DataDir should still cache within EmptyInfoProbeCacheTTL, got probeCount=%d want=1", probeCount)
+	}
 
-	if probeCount != 5 {
-		t.Errorf("empty DataDir should bypass cache, got probeCount=%d want=5", probeCount)
+	// 把 lastProbed 倒拨到 EmptyInfoProbeCacheTTL 之前，应该 reprobe
+	d.mu.Lock()
+	d.cache[1234].lastProbed = time.Now().Add(-EmptyInfoProbeCacheTTL - time.Second)
+	d.mu.Unlock()
+
+	if _, err := d.getOrProbe(1234, probe); err != nil {
+		t.Fatal(err)
+	}
+	if probeCount != 2 {
+		t.Errorf("empty DataDir should reprobe after EmptyInfoProbeCacheTTL, got probeCount=%d want=2", probeCount)
+	}
+}
+
+// TestGetOrProbe_EmptyDataDirTTLShorterThanPopulated 语义保证: 空 DataDir 的
+// TTL 必须严格短于已识别 DataDir 的 TTL，否则微信登录后无法及时被发现。
+func TestGetOrProbe_EmptyDataDirTTLShorterThanPopulated(t *testing.T) {
+	if EmptyInfoProbeCacheTTL >= ProbeCacheTTL {
+		t.Fatalf("EmptyInfoProbeCacheTTL (%v) must be < ProbeCacheTTL (%v) to keep login responsiveness",
+			EmptyInfoProbeCacheTTL, ProbeCacheTTL)
 	}
 }
 
