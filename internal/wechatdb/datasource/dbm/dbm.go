@@ -135,6 +135,13 @@ func (d *DBManager) OpenDB(path string) (*sql.DB, error) {
 		log.Err(err).Msgf("连接数据库 %s 失败", path)
 		return nil, err
 	}
+	// 限制 SQLite 连接池：chatlog 场景下并发 HTTP 请求很少真正并行查同一个库，
+	// 无上限会在高并发抖动时打开数十个 SQLite 连接，每个连接又会吃
+	// 3 个文件 HANDLE（.db / -wal / -shm）。ConnMaxIdleTime 让空闲连接
+	// 在几分钟后主动释放，避免 idle 连接长期 hold filecopy 临时文件。
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	d.mutex.Lock()
 	d.dbs[path] = db
 	d.mutex.Unlock()

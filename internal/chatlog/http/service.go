@@ -70,6 +70,7 @@ func NewService(conf Config, db *database.Service) *Service {
 		errors.ErrorHandlerMiddleware(),
 		gin.LoggerWithWriter(log.Logger, "/health"),
 		corsMiddleware(),
+		slowRequestMiddleware(SlowRequestThreshold),
 	)
 
 	s := &Service{

@@ -17,6 +17,18 @@
 ## 更新日志
 
 ### 2026年4月18日
+- **Windows 句柄泄漏修复（后台长期运行稳定性）**：
+  - **问题背景**：chatlog 在 Windows 下连续跑几小时，`Get-Process chatlog` 的 `HandleCount` 会从几百涨到上万（实测 7 小时 14966，且仍在增长）。涨幅与 HTTP 请求活跃度 + 自动解密强相关。
+  - **根因**：TUI 的 refresh 循环每 1 秒 tick 一次 → `FindProcesses` → 对每个 Weixin 进程调 `gopsutil` 的 `p.OpenFiles()`。gopsutil v4.25.7 的 `OpenFilesWithContext` 在行 698 用 `windows.OpenProcess` 打开微信进程句柄，但函数返回前**没有 `defer windows.CloseHandle(process)`**，每次调用直接泄漏 1 个 Process HANDLE 到 chatlog 自己。现场抓到 96% 的 handle 都是 Process 类型，完全吻合。
+  - **修复**：`internal/wechat/process/windows/detector.go` 加 `PID → ProcessInfo` 缓存（`ProbeCacheTTL = 60s`）。同一个已登录的 Weixin PID 在 60 秒内直接复用缓存结果，不再调 `p.OpenFiles()`；PID 消失立即清缓存；`DataDir` 还为空（微信未登录）时保持每秒探测等登录。稳态下 handle 泄漏速率降到 ~0。
+  - **不碰 gopsutil 源码**：纯 chatlog 侧节流，避免 vendor 或 fork 带来的维护负担。已在 `detector_cache_test.go` 写 6 个单元测试固化行为（缓存命中/DataDir 空绕过/TTL 过期重探/错误不缓存/PID 清理/并发命中），防止未来回退。
+
+- **防御性观测（应对疑似 Context 死锁问题）**：
+  - **问题背景**：历史上曾出现过 GET `/` 耗时 5 分钟多的记录，疑似全局锁长期持有堵塞 HTTP。4 月 16 日 Context 并发重构后，近 4-5 天两台 VM 日志里都查不到 ≥1s 的请求，可能已被修好，但没有一击抓现场的工具。
+  - **`slowRequestMiddleware`**（`internal/chatlog/http/middleware.go`）：任何超过 `SlowRequestThreshold`（默认 1s）的 HTTP 请求会打 Warn 日志 + 附 8KB goroutine 栈头，未来若再出现 hang 一击抓住现场。
+  - **`/debug/pprof/*` 端点**（`internal/chatlog/http/route_pprof.go`）：挂标准库 `net/http/pprof`，仅允许 loopback（127.0.0.1/::1）访问，远端 IP 返回 403。出问题时 `curl http://127.0.0.1:5030/debug/pprof/goroutine?debug=2` 直接拉全进程栈。
+  - **SQLite 连接池限制**（`internal/wechatdb/datasource/dbm/dbm.go`）：为每个 `sql.Open` 设 `MaxOpenConns=4` / `MaxIdleConns=2` / `ConnMaxIdleTime=5min`，防止 HTTP 高并发抖动时打开数十个 SQLite 连接（每连接持 3 个文件 handle：`.db` / `-wal` / `-shm`）。
+
 - **Backup 文件夹作为 `/image/{md5}` 原图兜底来源**：
   - **问题背景**：第三方 hook 软件（如 WXAutoImage）会自动从微信 CDN 拉取原图保存到 backup 目录，避免 15 天后 CDN 原图丢失。此前 chatlog 的 `/image/{md5}` 接口只查 `msg/attach`，找不到原图就直接返回缩略图 `_t.dat`，下游消费的只能是模糊缩略图，**明明 backup 里有清晰原图也用不上**。
   - **全新决策树**（`route.go` `serveImage`），全程 O(1) / 单目录 O(log N) 查询，**最坏 <100ms 确定 hit 或 miss**：
