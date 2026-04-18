@@ -16,6 +16,43 @@
 
 ## 更新日志
 
+### 2026年4月18日
+- **Backup 文件夹作为 `/image/{md5}` 原图兜底来源**：
+  - **问题背景**：第三方 hook 软件（如 WXAutoImage）会自动从微信 CDN 拉取原图保存到 backup 目录，避免 15 天后 CDN 原图丢失。此前 chatlog 的 `/image/{md5}` 接口只查 `msg/attach`，找不到原图就直接返回缩略图 `_t.dat`，下游消费的只能是模糊缩略图，**明明 backup 里有清晰原图也用不上**。
+  - **全新决策树**（`route.go` `serveImage`），全程 O(1) / 单目录 O(log N) 查询，**最坏 <100ms 确定 hit 或 miss**：
+    ```
+    [1] hardlink 原图 / 高清图        → 直接返回
+    [1'] hardlink 缩略图               → 记为候选, 继续查
+    [2] md5PathCache + 严格后缀查找    → 只认 .dat / _h.dat (点查)
+    [3] backup 目录                    → O(1) 索引 + 单目录 ReadDir
+    [4] 缩略图兜底                     → 仅从 hardlink 候选或 cache 宽松查找
+    [5] 彻底 miss → 404 + X-Backup-Hint: warm-cache-first
+    ```
+  - **不做 msg/attach 全树遍历**：真实环境 `msg/attach` 常达 10 万+ 文件，Windows NTFS 冷缓存下 `filepath.Walk` 需 1-2 分钟, 浏览器会看作永久 hang。宁可快速 404 + 提示下游"先调 `/api/v1/chatlog` 预热 cache"。
+  - **两套 talker → 目录 映射共存**：
+    - `@chatroom` 自动模式：目录名尾部带 `(xxx@chatroom)` 或 `(wxid_xxx)` 的群/联系人，零配置自动识别
+    - `hex` 配置模式：目录名尾部是 8 位十六进制（如 `拼车群(C606ACFA)`）的群，需要在 config 里填 `backup_folder_map` 手动映射 `talker → hex`（hex 由 hook 软件自行哈希，我们无法推导）
+  - **新增配置字段** `backup_folder_map`（`~/.chatlog/chatlog.json`，以及 server 子命令的 `chatlog-server.json`）：
+    ```json
+    {
+      "backup_path": "D:\\WXAutoImage",
+      "backup_folder_map": {
+        "27580424670@chatroom": "C606ACFA",
+        "wxid_xxx": "A4740C64"
+      }
+    }
+    ```
+    配一次长期有效。在 TUI "设置 → 备份目录" 打开可实时查看 `[已识别 自动=N 配置=N 未知=N]` 状态行。
+  - **前置条件 — cache 必须预热**：`/image/{md5}` 的 backup 分支依赖 `md5PathCache` 里的 `talker + time` 元数据，这由 `/api/v1/chatlog` 的调用填充。直连 `/image` 的下游（MCP 客户端、保存的链接等）若此前没调过 `/api/v1/chatlog`，backup 分支无法启用，会快速 404 并在响应头返回 `X-Backup-Hint: warm-cache-first`。**正确用法：先用完整 `?time=&talker=&limit=1000` 预热，再拉 `/image`**。
+  - **响应头诊断**：
+    - `X-Image-Source: backup` — 命中 backup 原图
+    - `X-Image-Quality: thumbnail` — 只拿到缩略图
+    - `X-Backup-Hint: warm-cache-first` — 缓存未预热, 下游应先调 `/api/v1/chatlog`
+  - **新增统计接口** `/api/v1/backup/stats`：返回 `hardlink / cache / backup / thumbnail / not_found` 来源计数器 + 索引概况 (`chatroom_mode / hex_mode / unknown / folder_map_entries`)，实测 backup 是否真的在工作。`/api/v1/cache/clear` 会同时归零计数器并重扫 backup 索引 + 热更 `backup_folder_map`。
+  - **安全硬化**：backup 子目录做 `EvalSymlinks` 前缀校验，拒绝 symlink 逃逸 backup_path 之外的路径。
+  - **观测性**：每次 `/image/{md5}` 打一条结构化日志，含 `source` / `resolve_via` / `talker` / `path`，便于排查哪层 miss。
+  - **适用规模**：内部测试环境 277 个 backup 群目录 + 9.6 万 `msg/attach` 文件 + 10 万消息 md5 缓存，全链路延迟稳定 <100ms。
+
 ### 2026年4月17日
 - **后台长期运行优化（让位微信）**：
   - **问题背景**：自动解密开启后，打开微信图片、收发消息时会感到微信明显卡顿。根源是 chatlog 在微信写数据库时同步去读取解密，两者争抢磁盘 IO。
