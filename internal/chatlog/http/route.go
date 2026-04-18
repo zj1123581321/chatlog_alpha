@@ -5,7 +5,6 @@ import (
 	"embed"
 	"encoding/csv"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -28,6 +27,14 @@ import (
 //
 //go:embed static
 var EFS embed.FS
+
+// imageOriginalSuffixes 是"原图/高清图"的后缀列表, 不含 _t.dat 缩略图。
+// 用于严格兜底查找: 只有这两种格式才被当成"找到了原图", 缩略图必须进入 backup
+// 分支或最终的 thumbnail 兜底。
+var imageOriginalSuffixes = []string{".dat", "_h.dat"}
+
+// imageAllSuffixes 包含全部图片后缀, 最后才尝试的宽松查找 (可能返回缩略图)。
+var imageAllSuffixes = []string{".dat", "_h.dat", "_t.dat"}
 
 func (s *Service) initRouter() {
 	s.initBaseRouter()
@@ -479,30 +486,25 @@ func (s *Service) handleMedia(c *gin.Context, _type string) {
 				return
 			}
 		}
+
+		// Image 类型走新决策树 (原图 → backup → 缩略图), 详见 serveImage。
+		if _type == "image" && !strings.Contains(k, "/") {
+			if s.serveImage(c, k) {
+				return
+			}
+			_err = errors.ErrMediaNotFound
+			continue
+		}
+
+		// 非 image (voice/video/file) 走既有逻辑: hardlink → 缓存路径 fallback。
 		media, err := s.db.GetMedia(_type, k)
 		if err != nil {
-			// Fallback 1: try to find path from md5->path cache
-			if cachedPath := s.getMD5FromCache(k); cachedPath != "" {
-				// Try to find the actual file with different suffixes
-				if absolutePath := s.tryFindFileWithSuffixes(cachedPath); absolutePath != "" {
-					if _type == "image" {
-						s.handleImageFile(c, absolutePath)
-						return
-					}
-					c.Redirect(http.StatusFound, "/data/"+cachedPath)
+			if meta, ok := s.getCachedMeta(k); ok && meta.Path != "" {
+				if absolutePath := s.tryFindFileWithSuffixes(meta.Path); absolutePath != "" {
+					c.Redirect(http.StatusFound, "/data/"+meta.Path)
 					return
 				}
 			}
-
-			// Fallback 2: try to find file by md5 in msg/attach directory
-			if _type == "image" && !strings.Contains(k, "/") {
-				if foundPath := s.findImageByMD5(k); foundPath != "" {
-					// Process the found image file
-					s.handleImageFile(c, foundPath)
-					return
-				}
-			}
-
 			_err = err
 			continue
 		}
@@ -514,11 +516,7 @@ func (s *Service) handleMedia(c *gin.Context, _type string) {
 		case "voice":
 			s.HandleVoice(c, media.Data)
 			return
-		case "image":
-			s.handleImageFile(c, filepath.Join(s.conf.GetDataDir(), media.Path))
-			return
 		default:
-			// For other types, keep the old redirect logic
 			c.Redirect(http.StatusFound, "/data/"+media.Path)
 			return
 		}
@@ -528,6 +526,152 @@ func (s *Service) handleMedia(c *gin.Context, _type string) {
 		errors.Err(c, _err)
 		return
 	}
+}
+
+// getMediaFromDB 是 db.GetMedia 的 nil-safe 封装, 让测试可以用 db=nil 构造 Service。
+// 线上路径 db 永不为 nil。
+func (s *Service) getMediaFromDB(_type, key string) (*model.Media, error) {
+	if s.db == nil {
+		return nil, nil
+	}
+	return s.db.GetMedia(_type, key)
+}
+
+// serveImage 实现 /image/{md5} 的完整决策树, 全程只做 O(1) / 单目录 O(log N) 查询,
+// 不做任何全树 walk, 确保任何请求 <100ms 完成 (或 <100ms 确定 miss):
+//
+//   [1] hardlink 原图 / 高清图        → 直接返回
+//   [1'] hardlink 缩略图               → 记为候选, 继续查
+//   [2] md5PathCache + 严格后缀查找    → 只认 .dat / _h.dat (点查)
+//   [3] backup 目录 (需要 cache 里的 talker+time 元数据, O(1) 索引 + 单目录 ReadDir)
+//   [4] 缩略图兜底 (hardlink 候选 或 cache 宽松查找)
+//       + 响应头 X-Image-Quality: thumbnail
+//       + 若缓存无 meta, 额外加 X-Backup-Hint: warm-cache-first
+//   [5] 全部 miss → 返回 false, 由调用方回 404
+//
+//   ⚠ 设计取舍: 不做 msg/attach 全树遍历兜底。真实环境 msg/attach 常达 10 万+ 文件,
+//   Windows NTFS 冷缓存下 filepath.Walk 需 1-2 分钟, 浏览器会看作永久 hang。
+//   无 meta 时宁可快速 404 + 提示下游 "先调 /api/v1/chatlog 预热", 也不拖死请求。
+//
+// 返回 true 表示已写 HTTP 响应, 调用方无需继续处理。
+func (s *Service) serveImage(c *gin.Context, md5 string) bool {
+	// ?info=1 保留调试接口: 直接返回 hardlink 表记录
+	if c.Query("info") != "" {
+		if media, err := s.getMediaFromDB("image", md5); err == nil && media != nil {
+			c.JSON(http.StatusOK, media)
+			return true
+		}
+		return false
+	}
+
+	var thumbCandidate string
+
+	// [1] hardlink
+	if media, err := s.getMediaFromDB("image", md5); err == nil && media != nil {
+		full := filepath.Join(s.conf.GetDataDir(), media.Path)
+		if isThumbnailPath(media.Path) {
+			thumbCandidate = full
+		} else {
+			s.backupStats.inc("hardlink")
+			log.Debug().Str("md5", md5).Str("source", "hardlink").Str("path", media.Path).Msg("image served")
+			s.handleImageFile(c, full)
+			return true
+		}
+	}
+
+	meta, hasMeta := s.getCachedMeta(md5)
+
+	// [2] cache → 严格查找原图
+	if hasMeta && meta.Path != "" {
+		if p := s.tryFindFileWithSuffixesStrict(meta.Path); p != "" {
+			s.backupStats.inc("cache")
+			log.Debug().Str("md5", md5).Str("source", "cache").Str("path", p).Msg("image served")
+			s.handleImageFile(c, p)
+			return true
+		}
+	}
+
+	// [3] backup (需要 talker + time, cache 有 meta 才能走) — 快路径
+	if hasMeta && meta.Talker != "" && !meta.Time.IsZero() {
+		if p, via := s.findImageFromBackup(meta.Talker, meta.Time); p != "" {
+			s.backupStats.inc("backup")
+			log.Info().
+				Str("md5", md5).
+				Str("source", "backup").
+				Str("resolve_via", via).
+				Str("talker", meta.Talker).
+				Str("path", p).
+				Msg("image served from backup")
+			c.Header("X-Image-Source", "backup")
+			c.File(p)
+			return true
+		}
+	}
+
+	// [4] 缩略图兜底: hardlink 候选 > 宽松 cache 查找。不走 msg/attach 全树 walk,
+	// 无 meta 时 thumbCandidate 仍为空, 直接走 [5] 404。
+	if thumbCandidate == "" && hasMeta && meta.Path != "" {
+		thumbCandidate = s.tryFindFileWithSuffixes(meta.Path)
+	}
+	if thumbCandidate != "" {
+		c.Header("X-Image-Quality", "thumbnail")
+		if !hasMeta {
+			c.Header("X-Backup-Hint", "warm-cache-first")
+		}
+		s.backupStats.inc("thumbnail")
+		log.Debug().
+			Str("md5", md5).
+			Str("source", "thumbnail").
+			Bool("has_meta", hasMeta).
+			Str("path", thumbCandidate).
+			Msg("image served as thumbnail")
+		s.handleImageFile(c, thumbCandidate)
+		return true
+	}
+
+	// [5] 彻底 miss: 给调用方一个 hint header, 让没预热 cache 的用户知道怎么办。
+	// 后续调用方会落到 NoRoute/404, hint 保留在响应里。
+	if !hasMeta {
+		c.Header("X-Backup-Hint", "warm-cache-first")
+	}
+	s.backupStats.inc("")
+	return false
+}
+
+// isThumbnailPath 判断给定路径是否指向缩略图文件 (_t.dat)。
+func isThumbnailPath(p string) bool {
+	return strings.HasSuffix(strings.ToLower(p), "_t.dat")
+}
+
+// findImageFromBackup 基于 backupIndex + FindImagesByPrefix 在 backup 文件夹下
+// 查找匹配 (talker, time) 的原图。返回第一个命中的绝对路径和 resolve 来源;
+// miss 时返回两个空串。多匹配时 Warn 并返回第一个。
+func (s *Service) findImageFromBackup(talker string, t time.Time) (absPath, via string) {
+	if s.backupIndex == nil {
+		return "", ""
+	}
+	dir, via, ok := s.backupIndex.Resolve(talker)
+	if !ok {
+		return "", ""
+	}
+	monthDir := filepath.Join(dir, t.Format("2006-01"))
+	timePrefix := t.Format("20060102150405")
+	matches, err := FindImagesByPrefix(monthDir, timePrefix)
+	if err != nil {
+		log.Debug().Err(err).Str("month_dir", monthDir).Msg("backup lookup: month dir inaccessible")
+		return "", ""
+	}
+	if len(matches) == 0 {
+		return "", ""
+	}
+	if len(matches) > 1 {
+		log.Warn().
+			Strs("matches", matches).
+			Str("talker", talker).
+			Str("time", timePrefix).
+			Msg("backup: multiple files share same-second prefix, returning first")
+	}
+	return matches[0], via
 }
 
 func (s *Service) findPath(_type string, key string) (string, error) {
@@ -552,88 +696,36 @@ func (s *Service) findPath(_type string, key string) (string, error) {
 	return "", errors.ErrMediaNotFound
 }
 
-// findImageByMD5 searches for an image file by MD5 in the msg/attach directory
-// It tries different suffixes: _h.dat, .dat, _t.dat
-func (s *Service) findImageByMD5(md5 string) string {
-	dataDir := s.conf.GetDataDir()
-	attachDir := filepath.Join(dataDir, "msg", "attach")
-
-	// Check if attach directory exists
-	if _, err := os.Stat(attachDir); os.IsNotExist(err) {
-		return ""
-	}
-
-	var foundPath string
-
-	// Walk through the attach directory to find files matching the md5
-	err := filepath.Walk(attachDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Skip directories we can't access
-			if os.IsPermission(err) {
-				return filepath.SkipDir
-			}
-			return err
-		}
-
-		// Stop if we already found a file
-		if foundPath != "" {
-			return io.EOF
-		}
-
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-
-		// Check if file name contains the md5
-		baseName := strings.ToLower(filepath.Base(path))
-		if !strings.Contains(baseName, strings.ToLower(md5)) {
-			return nil
-		}
-
-		// Check if it's a .dat file
-		if !strings.HasSuffix(baseName, ".dat") {
-			return nil
-		}
-
-		// Try to read and verify the file
-		if _, err := os.Stat(path); err == nil {
-			foundPath = path
-			return io.EOF
-		}
-
-		return nil
-	})
-
-	// If we found io.EOF, it means we found the file
-	if err == io.EOF && foundPath != "" {
-		return foundPath
-	}
-
-	return ""
-}
-
-// getMD5FromCache retrieves path from md5->path cache
-func (s *Service) getMD5FromCache(md5 string) string {
+// getCachedMeta 返回 md5PathCache 中对应的元数据 (路径 + talker + 时间)。
+// cache miss 时返回零值 CachedMediaMeta 和 ok=false。
+func (s *Service) getCachedMeta(md5 string) (CachedMediaMeta, bool) {
 	s.md5PathMu.RLock()
 	defer s.md5PathMu.RUnlock()
-
-	if path, ok := s.md5PathCache[md5]; ok {
-		log.Debug().Str("md5", md5).Str("path", path).Msg("Cache hit for md5")
-		return path
+	meta, ok := s.md5PathCache[md5]
+	if ok {
+		log.Debug().Str("md5", md5).Str("path", meta.Path).Msg("Cache hit for md5")
+	} else {
+		log.Debug().Str("md5", md5).Msg("Cache miss for md5")
 	}
-
-	log.Debug().Str("md5", md5).Msg("Cache miss for md5")
-	return ""
+	return meta, ok
 }
 
-// tryFindFileWithSuffixes tries to find a file with different suffixes
-// Priority: .dat (original) -> _h.dat (HD) -> _t.dat (thumbnail)
+// tryFindFileWithSuffixes 宽松查找: 按 .dat → _h.dat → _t.dat 顺序返回第一个
+// 存在的文件路径。可能返回缩略图, 只用于最终兜底。
 func (s *Service) tryFindFileWithSuffixes(basePath string) string {
-	dataDir := s.conf.GetDataDir()
+	return s.tryFindFileWithSuffixList(basePath, imageAllSuffixes)
+}
 
-	// Try different suffixes with priority: original -> HD -> thumbnail
-	suffixes := []string{".dat", "_h.dat", "_t.dat"}
+// tryFindFileWithSuffixesStrict 严格查找: 只接受 .dat 或 _h.dat, 明确拒绝缩略图。
+// 新决策树的 [2]、[3] 步骤使用, 把 _t.dat 留给 backup 分支优先尝试。
+func (s *Service) tryFindFileWithSuffixesStrict(basePath string) string {
+	return s.tryFindFileWithSuffixList(basePath, imageOriginalSuffixes)
+}
+
+// tryFindFileWithSuffixList 按给定顺序逐一探测 dataDir + basePath + suffix 是否存在。
+// 最后也会尝试 basePath 本身 (不加后缀, 覆盖"路径已含扩展名"的情况)。
+func (s *Service) tryFindFileWithSuffixList(basePath string, suffixes []string) string {
+	dataDir := s.conf.GetDataDir()
 
 	for _, suffix := range suffixes {
 		testPath := filepath.Join(dataDir, basePath+suffix)
@@ -643,11 +735,12 @@ func (s *Service) tryFindFileWithSuffixes(basePath string) string {
 		}
 	}
 
-	// Try without any suffix (might already have extension)
 	testPath := filepath.Join(dataDir, basePath)
 	if _, err := os.Stat(testPath); err == nil {
-		log.Debug().Str("path", testPath).Msg("Found file without suffix")
-		return testPath
+		if !isThumbnailPath(testPath) || len(suffixes) == len(imageAllSuffixes) {
+			log.Debug().Str("path", testPath).Msg("Found file without suffix")
+			return testPath
+		}
 	}
 
 	log.Debug().Str("basePath", basePath).Msg("File not found with any suffix")
@@ -655,6 +748,9 @@ func (s *Service) tryFindFileWithSuffixes(basePath string) string {
 }
 
 // populateMD5PathCache populates the md5->path cache from messages
+// populateMD5PathCache 从 /api/v1/chatlog 返回的消息里抽取 md5 → {path, talker, time}
+// 映射。talker 和 time 在 backup 兜底查询时必需, 没有它们 /image/{md5} 对只有缩略图
+// 的消息无法找到 hook 软件保存的原图。
 func (s *Service) populateMD5PathCache(messages []*model.Message) {
 	s.md5PathMu.Lock()
 	defer s.md5PathMu.Unlock()
@@ -671,18 +767,23 @@ func (s *Service) populateMD5PathCache(messages []*model.Message) {
 			continue
 		}
 
-		// Get md5 from contents
 		md5Value, md5Ok := msg.Contents["md5"].(string)
 		if !md5Ok || md5Value == "" {
 			continue
 		}
 
-		// Get path from contents
-		pathValue, pathOk := msg.Contents["path"].(string)
-		if pathOk && pathValue != "" {
-			s.md5PathCache[md5Value] = pathValue
-			log.Debug().Str("md5", md5Value).Str("path", pathValue).Msg("Cached md5->path mapping")
+		pathValue, _ := msg.Contents["path"].(string)
+		s.md5PathCache[md5Value] = CachedMediaMeta{
+			Path:   pathValue,
+			Talker: msg.Talker,
+			Time:   msg.Time,
 		}
+		log.Debug().
+			Str("md5", md5Value).
+			Str("path", pathValue).
+			Str("talker", msg.Talker).
+			Time("time", msg.Time).
+			Msg("Cached md5 meta")
 	}
 }
 
@@ -922,7 +1023,20 @@ func (s *Service) handleClearCache(c *gin.Context) {
 		return
 	}
 
-	log.Info().Int("count", deletedCount).Msg("Cleared decrypted file cache")
+	// 同时清理进程内缓存: md5 → media meta, backup 索引, 请求统计。
+	// 下次 /api/v1/chatlog 会重新 populate, /image/{md5} 会触发新一次 backup Scan。
+	s.md5PathMu.Lock()
+	s.md5PathCache = make(map[string]CachedMediaMeta)
+	s.md5PathMu.Unlock()
+
+	if s.backupIndex != nil {
+		// 热更 folderMap (用户可能改了 config.json), 再重扫一次。
+		s.backupIndex.UpdateFolderMap(s.conf.GetBackupFolderMap())
+		_ = s.backupIndex.Scan()
+	}
+	s.backupStats.reset()
+
+	log.Info().Int("count", deletedCount).Msg("Cleared decrypted file cache + in-memory caches")
 	c.JSON(http.StatusOK, gin.H{
 		"message":      "Cache cleared successfully",
 		"deletedCount": deletedCount,

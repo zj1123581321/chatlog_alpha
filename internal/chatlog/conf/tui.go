@@ -1,11 +1,12 @@
 package conf
 
 type TUIConfig struct {
-	ConfigDir   string          `mapstructure:"-" json:"config_dir"`
-	LastAccount string          `mapstructure:"last_account" json:"last_account"`
-	BackupPath  string          `mapstructure:"backup_path" json:"backup_path"`
-	History     []ProcessConfig `mapstructure:"history" json:"history"`
-	Webhook     *Webhook        `mapstructure:"webhook" json:"webhook"`
+	ConfigDir       string            `mapstructure:"-" json:"config_dir"`
+	LastAccount     string            `mapstructure:"last_account" json:"last_account"`
+	BackupPath      string            `mapstructure:"backup_path" json:"backup_path"`
+	BackupFolderMap map[string]string `mapstructure:"backup_folder_map" json:"backup_folder_map,omitempty"`
+	History         []ProcessConfig   `mapstructure:"history" json:"history"`
+	Webhook         *Webhook          `mapstructure:"webhook" json:"webhook"`
 }
 
 var TUIDefaults = map[string]any{}

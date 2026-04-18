@@ -468,6 +468,13 @@ func (c *Context) GetBackupPath() string {
 	return c.conf.BackupPath
 }
 
+// GetBackupFolderMap returns the talker → folder_id (hex) mapping for backup lookups.
+// Only used when the backup directory uses the hex folder_id naming convention
+// (e.g. "群名(C606ACFA)"); @chatroom-suffixed directories are resolved automatically.
+func (c *Context) GetBackupFolderMap() map[string]string {
+	return c.conf.BackupFolderMap
+}
+
 // --- Setters (all Lock-protected) ---
 
 func (c *Context) SetHTTPEnabled(enabled bool) {

@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -12,13 +13,15 @@ import (
 
 // mockBackupConfig 实现 Config 接口，用于 backup 端点测试。
 type mockBackupConfig struct {
-	backupPath string
+	backupPath      string
+	backupFolderMap map[string]string
 }
 
-func (m *mockBackupConfig) GetHTTPAddr() string         { return ":5030" }
-func (m *mockBackupConfig) GetDataDir() string          { return "" }
-func (m *mockBackupConfig) GetSaveDecryptedMedia() bool { return false }
-func (m *mockBackupConfig) GetBackupPath() string       { return m.backupPath }
+func (m *mockBackupConfig) GetHTTPAddr() string                     { return ":5030" }
+func (m *mockBackupConfig) GetDataDir() string                      { return "" }
+func (m *mockBackupConfig) GetSaveDecryptedMedia() bool             { return false }
+func (m *mockBackupConfig) GetBackupPath() string                   { return m.backupPath }
+func (m *mockBackupConfig) GetBackupFolderMap() map[string]string   { return m.backupFolderMap }
 
 // setupBackupTestRouter 创建一个用于测试的 gin 路由引擎。
 func setupBackupTestRouter(conf Config) *Service {
@@ -27,8 +30,10 @@ func setupBackupTestRouter(conf Config) *Service {
 	s := &Service{
 		conf:         conf,
 		router:       router,
-		md5PathCache: make(map[string]string),
+		md5PathCache: make(map[string]CachedMediaMeta),
+		backupIndex:  NewBackupIndex(conf.GetBackupPath(), conf.GetBackupFolderMap()),
 	}
+	_ = s.backupIndex.Scan()
 	s.initBackupRouter()
 	return s
 }
@@ -124,6 +129,88 @@ func TestBackupImageNotFound_Returns404(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestBackupStats_InitialZero(t *testing.T) {
+	s := setupBackupTestRouter(&mockBackupConfig{backupPath: ""})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/backup/stats", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	// 初始所有计数器都是 0, 索引也是空
+	for _, want := range []string{
+		`"hardlink":0`,
+		`"cache":0`,
+		`"recurse":0`,
+		`"backup":0`,
+		`"thumbnail":0`,
+		`"not_found":0`,
+		`"chatroom_mode":0`,
+		`"hex_mode":0`,
+		`"unknown":0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected body to contain %q, got %s", want, body)
+		}
+	}
+}
+
+func TestBackupStats_ReflectsCounters(t *testing.T) {
+	s := setupBackupTestRouter(&mockBackupConfig{backupPath: ""})
+	// 手动模拟几次命中
+	s.backupStats.inc("hardlink")
+	s.backupStats.inc("hardlink")
+	s.backupStats.inc("backup")
+	s.backupStats.inc("thumbnail")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/backup/stats", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"hardlink":2`) {
+		t.Errorf("hardlink=2 missing, body=%s", body)
+	}
+	if !strings.Contains(body, `"backup":1`) {
+		t.Errorf("backup=1 missing, body=%s", body)
+	}
+	if !strings.Contains(body, `"thumbnail":1`) {
+		t.Errorf("thumbnail=1 missing, body=%s", body)
+	}
+}
+
+func TestBackupStats_IndexCountsReported(t *testing.T) {
+	tmp := t.TempDir()
+	// 一个 chatroom + 一个 hex + 一个 unknown
+	for _, name := range []string{"群A(x@chatroom)", "群B(AABBCCDD)", "未知"} {
+		if err := os.MkdirAll(filepath.Join(tmp, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := setupBackupTestRouter(&mockBackupConfig{backupPath: tmp})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/backup/stats", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	for _, want := range []string{
+		`"chatroom_mode":1`,
+		`"hex_mode":1`,
+		`"unknown":1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in body, got %s", want, body)
+		}
 	}
 }
 

@@ -14,6 +14,17 @@ import (
 	"github.com/sjzar/chatlog/internal/errors"
 )
 
+// CachedMediaMeta 是 /api/v1/chatlog 预热填充的媒体元数据, 供 /image/{md5} 在
+// hardlink 未命中或只命中缩略图时用于进一步兜底查询 (例如 backup 文件夹)。
+//
+// Talker 和 Time 在没有前置 /chatlog 调用时可能为零值: 该情况下 backup 兜底
+// 无法启用, 最终只能回退到缩略图。
+type CachedMediaMeta struct {
+	Path   string
+	Talker string
+	Time   time.Time
+}
+
 type Service struct {
 	conf Config
 	db   *database.Service
@@ -25,9 +36,15 @@ type Service struct {
 	mcpSSEServer        *server.SSEServer
 	mcpStreamableServer *server.StreamableHTTPServer
 
-	// md5 到 path 的缓存（用于图片、视频等媒体文件）
-	md5PathCache map[string]string
+	// md5 到媒体元数据的缓存, 由 /api/v1/chatlog 调用填充
+	md5PathCache map[string]CachedMediaMeta
 	md5PathMu    sync.RWMutex
+
+	// backup 目录反查索引, 启动时 Scan 一次, /api/v1/cache/clear 可触发重建
+	backupIndex *BackupIndex
+
+	// backup 请求来源分布统计 (原子计数), 暴露给 /api/v1/backup/stats
+	backupStats backupStats
 }
 
 type Config interface {
@@ -35,6 +52,7 @@ type Config interface {
 	GetDataDir() string
 	GetSaveDecryptedMedia() bool
 	GetBackupPath() string
+	GetBackupFolderMap() map[string]string
 }
 
 func NewService(conf Config, db *database.Service) *Service {
@@ -58,8 +76,12 @@ func NewService(conf Config, db *database.Service) *Service {
 		conf:         conf,
 		db:           db,
 		router:       router,
-		md5PathCache: make(map[string]string),
+		md5PathCache: make(map[string]CachedMediaMeta),
+		backupIndex:  NewBackupIndex(conf.GetBackupPath(), conf.GetBackupFolderMap()),
 	}
+
+	// 启动时同步扫一次 backup 目录。失败不阻塞启动 (Scan 内部只 Warn)。
+	_ = s.backupIndex.Scan()
 
 	s.initMCPServer()
 	s.initRouter()

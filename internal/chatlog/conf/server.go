@@ -17,9 +17,10 @@ type ServerConfig struct {
 	AutoDecrypt        bool     `mapstructure:"auto_decrypt"`
 	WalEnabled         bool     `mapstructure:"wal_enabled"`
 	AutoDecryptDebounce int     `mapstructure:"auto_decrypt_debounce"`
-	SaveDecryptedMedia bool     `mapstructure:"save_decrypted_media"`
-	BackupPath         string   `mapstructure:"backup_path"`
-	Webhook            *Webhook `mapstructure:"webhook"`
+	SaveDecryptedMedia bool              `mapstructure:"save_decrypted_media"`
+	BackupPath         string            `mapstructure:"backup_path"`
+	BackupFolderMap    map[string]string `mapstructure:"backup_folder_map"`
+	Webhook            *Webhook          `mapstructure:"webhook"`
 }
 
 var ServerDefaults = map[string]any{
@@ -79,4 +80,8 @@ func (c *ServerConfig) GetSaveDecryptedMedia() bool {
 
 func (c *ServerConfig) GetBackupPath() string {
 	return c.BackupPath
+}
+
+func (c *ServerConfig) GetBackupFolderMap() map[string]string {
+	return c.BackupFolderMap
 }
