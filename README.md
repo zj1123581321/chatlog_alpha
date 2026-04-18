@@ -19,9 +19,14 @@
 ### 2026年4月18日
 - **Windows 句柄泄漏修复（后台长期运行稳定性）**：
   - **问题背景**：chatlog 在 Windows 下连续跑几小时，`Get-Process chatlog` 的 `HandleCount` 会从几百涨到上万（实测 7 小时 14966，且仍在增长）。涨幅与 HTTP 请求活跃度 + 自动解密强相关。
-  - **根因**：TUI 的 refresh 循环每 1 秒 tick 一次 → `FindProcesses` → 对每个 Weixin 进程调 `gopsutil` 的 `p.OpenFiles()`。gopsutil v4.25.7 的 `OpenFilesWithContext` 在行 698 用 `windows.OpenProcess` 打开微信进程句柄，但函数返回前**没有 `defer windows.CloseHandle(process)`**，每次调用直接泄漏 1 个 Process HANDLE 到 chatlog 自己。现场抓到 96% 的 handle 都是 Process 类型，完全吻合。
-  - **修复**：`internal/wechat/process/windows/detector.go` 加 `PID → ProcessInfo` 缓存（`ProbeCacheTTL = 60s`）。同一个已登录的 Weixin PID 在 60 秒内直接复用缓存结果，不再调 `p.OpenFiles()`；PID 消失立即清缓存；`DataDir` 还为空（微信未登录）时保持每秒探测等登录。稳态下 handle 泄漏速率降到 ~0。
-  - **不碰 gopsutil 源码**：纯 chatlog 侧节流，避免 vendor 或 fork 带来的维护负担。已在 `detector_cache_test.go` 写 6 个单元测试固化行为（缓存命中/DataDir 空绕过/TTL 过期重探/错误不缓存/PID 清理/并发命中），防止未来回退。
+  - **根因**：TUI 的 refresh 循环每 1 秒 tick 一次 → `FindProcesses` → 对每个 Weixin 进程调 `gopsutil` 的 `p.OpenFiles()`。gopsutil v4.25.7 的 `OpenFilesWithContext` 在行 698 用 `windows.OpenProcess` 打开微信进程句柄，但函数返回前**没有 `defer windows.CloseHandle(process)`**，每次调用直接泄漏 1 个 Process HANDLE 到 chatlog 自己。现场抓到 99.4% 的 handle 都是 Process 类型，完全吻合。
+  - **首版修复（commit `ae07830`）失败**：加了 `PID → ProcessInfo` 缓存，条件为 `DataDir != ""` 才算命中。但长跑观测显示 handle 仍以 ~11000/h 涨。原因是 Weixin 4.1.5 主进程稳态**并不持续持有 `session.db` 的 File HANDLE**（实测只保持 `message_fts.db` / `favorite_*.db-wal` / `login_configv2` 等），而 `initializeProcessInfo` 只匹配 `session.db` 后缀，于是 DataDir 一直是空、cache 条件恒假、每秒继续重探命中 gopsutil 那个 bug。
+  - **最终修复（commit `62e138b`）**，三件事一起做：
+    1. **`\db_storage\` 通配识别**：`initializeProcessInfo` 先找 `session.db`（最精确），找不到就退化到匹配任意 `\db_storage\` 子文件反推 DataDir。主进程一次探测就能拿到 DataDir 进长 TTL 缓存。
+    2. **空 DataDir 也缓存**（`EmptyInfoProbeCacheTTL = 30s`）：即便识别失败也在短 TTL 内复用结果，兜底抑制 HANDLE 泄漏，同时保留微信登录后 30 秒内可感知的识别延迟。
+    3. **Weixin 子进程直接 skip**：`cmdline` 含 `--` 的 renderer/gpu 子进程从来没有 `db_storage` 路径，对它们调 `p.OpenFiles()` 只会泄漏 handle 拿不到有用信息，识别前就 `continue`，连 cache 条目都不留。
+  - **实测效果**：修复前两台 VM 1.67h 内涨到 18000+ handle、约 11000/h；`62e138b` 部署重启后 1.2h 稳在 285–307 handle、约 250/h —— **同等负载下泄漏速率下降 43–46 倍**。
+  - **不碰 gopsutil 源码**：纯 chatlog 侧节流，避免 vendor 或 fork 带来的维护负担。`detector_cache_test.go` 有 7 个单元测试固化行为（稳态缓存命中、空 DataDir 短 TTL 仍缓存、`EmptyInfoProbeCacheTTL < ProbeCacheTTL` 语义约束、TTL 过期重探、错误不缓存、PID 清理、并发命中），防止未来回退。
 
 - **防御性观测（应对疑似 Context 死锁问题）**：
   - **问题背景**：历史上曾出现过 GET `/` 耗时 5 分钟多的记录，疑似全局锁长期持有堵塞 HTTP。4 月 16 日 Context 并发重构后，近 4-5 天两台 VM 日志里都查不到 ≥1s 的请求，可能已被修好，但没有一击抓现场的工具。
