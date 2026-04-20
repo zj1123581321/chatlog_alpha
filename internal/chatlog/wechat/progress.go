@@ -119,3 +119,31 @@ func (p *ProgressPublisher) Close() {
 	}
 	p.subs = nil
 }
+
+// progressLogThrottle 决定是否为本条 event 打日志。
+// 打印条件：
+//   - 第一次 event                （lastLogPct == -1）
+//   - 进度增长 >= 5%
+//   - 距离上次打印 >= 30s
+//   - FilesDone == FilesTotal    （最终完成态，始终打）
+//
+// 无状态函数，caller 自己保存 lastLogPct / lastLogAt。
+func progressLogThrottle(evt ProgressEvent, lastLogPct float64, lastLogAt time.Time) bool {
+	if lastLogPct < 0 { // 首次
+		return true
+	}
+	if evt.FilesTotal > 0 && evt.FilesDone >= evt.FilesTotal {
+		return true
+	}
+	if evt.BytesTotal <= 0 {
+		return false
+	}
+	currPct := float64(evt.BytesDone) / float64(evt.BytesTotal) * 100
+	if currPct-lastLogPct >= 5 {
+		return true
+	}
+	if time.Since(lastLogAt) >= 30*time.Second {
+		return true
+	}
+	return false
+}

@@ -154,6 +154,54 @@ func TestProgressPublisher_PublishAfterClose_NoOp(t *testing.T) {
 	pub.Publish(makeEvt(1, 10))
 }
 
+// --- progressLogThrottle 节流单测 ---
+
+func TestProgressLogThrottle_FirstEvent_AlwaysLogs(t *testing.T) {
+	evt := ProgressEvent{FilesDone: 1, FilesTotal: 10, BytesDone: 100, BytesTotal: 1000}
+	if !progressLogThrottle(evt, -1.0, time.Time{}) {
+		t.Error("first event (lastLogPct == -1) should log")
+	}
+}
+
+func TestProgressLogThrottle_FinalEvent_AlwaysLogs(t *testing.T) {
+	evt := ProgressEvent{FilesDone: 10, FilesTotal: 10, BytesDone: 1000, BytesTotal: 1000}
+	if !progressLogThrottle(evt, 99.0, time.Now()) {
+		t.Error("final event (FilesDone == FilesTotal) should log")
+	}
+}
+
+func TestProgressLogThrottle_Below5Pct_NoLog(t *testing.T) {
+	// 已打过 10%，现在 11%，差 1% < 5%，不应打
+	evt := ProgressEvent{FilesDone: 11, FilesTotal: 100, BytesDone: 110, BytesTotal: 1000}
+	if progressLogThrottle(evt, 10.0, time.Now()) {
+		t.Error("delta 1%% (< 5%%) should NOT log")
+	}
+}
+
+func TestProgressLogThrottle_Above5Pct_Logs(t *testing.T) {
+	// 已打过 10%，现在 15.5%，差 5.5% >= 5%，应打
+	evt := ProgressEvent{FilesDone: 15, FilesTotal: 100, BytesDone: 155, BytesTotal: 1000}
+	if !progressLogThrottle(evt, 10.0, time.Now()) {
+		t.Error("delta >= 5%% should log")
+	}
+}
+
+func TestProgressLogThrottle_TimeBased_LogsAfter30s(t *testing.T) {
+	// 进度只涨了 1%，但上次打印是 31 秒前，应打
+	evt := ProgressEvent{FilesDone: 11, FilesTotal: 100, BytesDone: 110, BytesTotal: 1000}
+	if !progressLogThrottle(evt, 10.0, time.Now().Add(-31*time.Second)) {
+		t.Error("31s since last log should trigger regardless of pct")
+	}
+}
+
+func TestProgressLogThrottle_ZeroTotalBytes_DoesNotLog(t *testing.T) {
+	// BytesTotal=0 且已过首次：不应 log，避免 div-by-zero
+	evt := ProgressEvent{FilesDone: 5, FilesTotal: 10, BytesDone: 0, BytesTotal: 0}
+	if progressLogThrottle(evt, 50.0, time.Now()) {
+		t.Error("zero total bytes should not log (except first / final)")
+	}
+}
+
 func TestProgressPublisher_Concurrent_PublishAndSubscribe_RaceClean(t *testing.T) {
 	// go test -race 下跑：验证并发 publish / subscribe / cancel 不爆 race detector
 	pub := NewProgressPublisher()

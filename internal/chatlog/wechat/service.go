@@ -133,6 +133,61 @@ func (s *Service) Subscribe() (<-chan ProgressEvent, func()) {
 	return pub.Subscribe()
 }
 
+// spawnProgressLogger 启动一个订阅者 goroutine 把进度节流打到 INF 日志。
+//
+// 节流：每 5% 或每 30s 一行，加上首条 + 最终态。避免 log spam（对 50 文件
+// 也能产生 ~100 行无用噪声）。
+//
+// 生命周期：publisher Close 时 range 自然退出。受 decryptWg 追踪，StopAutoDecrypt
+// 能 Wait 到干净退出。
+func (s *Service) spawnProgressLogger() {
+	s.mutex.Lock()
+	pub := s.progressPub
+	s.mutex.Unlock()
+	if pub == nil {
+		return
+	}
+	ch, _ := pub.Subscribe()
+
+	s.decryptWg.Add(1)
+	go func() {
+		defer s.decryptWg.Done()
+		defer s.recoverDecryptPanic("progressLogger")
+
+		lastLogPct := -1.0
+		lastLogAt := time.Time{}
+
+		for evt := range ch {
+			if !progressLogThrottle(evt, lastLogPct, lastLogAt) {
+				continue
+			}
+
+			pct := 0.0
+			if evt.BytesTotal > 0 {
+				pct = float64(evt.BytesDone) / float64(evt.BytesTotal) * 100
+			}
+			elapsed := time.Duration(0)
+			if !evt.StartedAt.IsZero() {
+				elapsed = evt.UpdatedAt.Sub(evt.StartedAt)
+			}
+
+			logEvent := log.Info().
+				Str("phase", string(evt.Phase)).
+				Int("files_done", evt.FilesDone).
+				Int("files_total", evt.FilesTotal).
+				Float64("pct", pct).
+				Dur("elapsed", elapsed)
+			if evt.CurrentFile != "" {
+				logEvent = logEvent.Str("file", filepath.Base(evt.CurrentFile))
+			}
+			logEvent.Msg("[autodecrypt-progress]")
+
+			lastLogPct = pct
+			lastLogAt = time.Now()
+		}
+	}()
+}
+
 // publishProgress 是内部 helper：nil-safe 地向 progressPub 发送一个事件。
 // Phase 自动从 s.GetPhase() 读取。
 func (s *Service) publishProgress(done, total int, bytesDone, bytesTotal int64, currentFile string, startedAt time.Time) {
@@ -253,6 +308,9 @@ func (s *Service) StartAutoDecrypt() error {
 		s.progressPub = NewProgressPublisher()
 	}
 	s.mutex.Unlock()
+
+	// 启动进度日志订阅者（publisher 独立订阅，节流打 INF）
+	s.spawnProgressLogger()
 
 	log.Info().
 		Str("data_dir", s.conf.GetDataDir()).
