@@ -1,6 +1,7 @@
 package wechat
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -100,6 +101,45 @@ func TestPickSmallestDB_ExcludesFtsFiles(t *testing.T) {
 		t.Errorf("got err %v, want ErrNoDBFile (fts files should be excluded)", err)
 	}
 }
+
+// --- DecryptSingleDBForPrecheck 错误路径测试 ---
+//
+// 注：happy path（真密钥 + 真加密 db）由 Stage G 的 UI 集成路径覆盖；
+// 这里只验证错误传播契约 —— "调不通就 return err"，不 panic、不 hang。
+// 覆盖 E-R1 / T3 的前置假设：预检函数不引入新的 panic 来源。
+
+// mockConfigPrecheck 专供预检测试，platform=windows v4 但 key 为空
+// 用于快速走到 decrypt 失败路径，验证错误冒泡。
+type mockConfigPrecheck struct {
+	mockConfig
+}
+
+func (m *mockConfigPrecheck) GetPlatform() string { return "windows" }
+func (m *mockConfigPrecheck) GetVersion() int     { return 4 }
+
+func TestDecryptSingleDBForPrecheck_FileNotFound_Propagates(t *testing.T) {
+	svc := NewService(&mockConfigPrecheck{})
+	err := svc.DecryptSingleDBForPrecheck(context.Background(), filepath.Join(t.TempDir(), "nonexistent.db"))
+	if err == nil {
+		t.Error("expected error for nonexistent file, got nil")
+	}
+}
+
+func TestDecryptSingleDBForPrecheck_InvalidPlatform_PropagatesNewDecryptorErr(t *testing.T) {
+	// 用 platform="unknown" 让 NewDecryptor 走失败分支，验证错误从 NewDecryptor 冒泡
+	svc := NewService(&mockConfigInvalidPlatform{})
+	err := svc.DecryptSingleDBForPrecheck(context.Background(), "/anywhere.db")
+	if err == nil {
+		t.Error("expected error for unknown platform, got nil")
+	}
+}
+
+type mockConfigInvalidPlatform struct {
+	mockConfig
+}
+
+func (m *mockConfigInvalidPlatform) GetPlatform() string { return "unknown_os" }
+func (m *mockConfigInvalidPlatform) GetVersion() int     { return 99 }
 
 func TestPickSmallestDB_ExcludesZeroByteFiles(t *testing.T) {
 	// 额外健壮性：0 字节文件（占位符）不应被选中

@@ -1,11 +1,17 @@
 package wechat
 
 import (
+	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/sjzar/chatlog/internal/wechat/decrypt"
+
+	chatlogerrors "github.com/sjzar/chatlog/internal/errors"
 )
 
 // ErrNoDBFile 表示 data dir 的 db_storage 下找不到任何可用于预检的 .db 文件。
@@ -87,4 +93,29 @@ func pickSmallestDB(dataDir string) (string, error) {
 		return "", ErrNoDBFile
 	}
 	return smallestPath, nil
+}
+
+// DecryptSingleDBForPrecheck 解一个 db 验证密钥是否正确 / 环境是否可用，
+// 输出写到 io.Discard 丢弃，不污染 workdir。用于"开启自动解密"按钮路径
+// 的秒级预检（替代原先跑全量的 DecryptDBFiles）。
+//
+// 返回：
+//   - nil                          密钥对、文件可读、解密逻辑通畅
+//   - ErrAlreadyDecrypted          该文件已经是明文（视为密钥验证通过）
+//   - decrypt.* 其他错误           冒泡给调用方走熔断 handler
+//
+// 调用方需要先 pickSmallestDB 挑一个稳定的 db 文件作为参数。
+func (s *Service) DecryptSingleDBForPrecheck(ctx context.Context, dbFile string) error {
+	decryptor, err := decrypt.NewDecryptor(s.conf.GetPlatform(), s.conf.GetVersion())
+	if err != nil {
+		return err
+	}
+
+	if err := decryptor.Decrypt(ctx, dbFile, s.conf.GetDataKey(), io.Discard); err != nil {
+		if err == chatlogerrors.ErrAlreadyDecrypted {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
