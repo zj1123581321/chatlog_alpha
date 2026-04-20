@@ -471,7 +471,9 @@ func (a *App) initMenu() {
 				// 在后台开启自动解密
 				go func() {
 					log.Info().Msg("[autodecrypt] goroutine 启动，调用 Manager.StartAutoDecrypt")
-					err := a.m.StartAutoDecrypt()
+					// 此处保持 SkipPrecheck:false（跑全量预检）。后续 Stage G 会改为
+					// SkipPrecheck:true + 单文件预检 + fire-and-forget 后台全量。
+					err := a.m.StartAutoDecrypt(StartAutoDecryptOpts{SkipPrecheck: false})
 					log.Info().Err(err).Msg("[autodecrypt] Manager.StartAutoDecrypt 返回，准备 QueueUpdateDraw")
 
 					// 在主线程中更新UI

@@ -70,7 +70,7 @@ func (m *Manager) Run(configPath string) error {
 		// 重置状态，由后台协程在成功后重新设置
 		m.ctx.SetAutoDecrypt(false)
 		go func() {
-			if err := m.StartAutoDecrypt(true); err != nil {
+			if err := m.StartAutoDecrypt(StartAutoDecryptOpts{SkipPrecheck: true}); err != nil {
 				log.Info().Err(err).Msg("恢复自动解密失败")
 				m.ctx.SetAutoDecrypt(false)
 			}
@@ -365,10 +365,18 @@ func (m *Manager) DecryptDBFiles() error {
 	return nil
 }
 
+// StartAutoDecryptOpts 配置 StartAutoDecrypt 的启动行为。
+// 替代原先的 skipPrecheck ...bool 可变参数，为后续传入 ctx / ProgressCh 做准备。
+type StartAutoDecryptOpts struct {
+	// SkipPrecheck 为 true 时跳过启动前预检，依赖运行期熔断兜底。
+	// 用于启动恢复场景（autoDecryptRecovery），也用于 UI 按钮路径（Stage G 后）走
+	// 秒级单文件预检而非全量。
+	SkipPrecheck bool
+}
+
 // StartAutoDecrypt 开启自动解密。
-// skipPrecheck 为 true 时跳过全量预检解密（用于启动恢复场景，依赖熔断机制兜底）。
-func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) (retErr error) {
-	log.Info().Bool("skip_precheck", len(skipPrecheck) > 0 && skipPrecheck[0]).Msg("[autodecrypt] Manager.StartAutoDecrypt 入口")
+func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
+	log.Info().Bool("skip_precheck", opts.SkipPrecheck).Msg("[autodecrypt] Manager.StartAutoDecrypt 入口")
 	defer func() {
 		log.Info().Err(retErr).Msg("[autodecrypt] Manager.StartAutoDecrypt 返回")
 	}()
@@ -377,7 +385,7 @@ func (m *Manager) StartAutoDecrypt(skipPrecheck ...bool) (retErr error) {
 		return fmt.Errorf("请先获取密钥")
 	}
 
-	if len(skipPrecheck) == 0 || !skipPrecheck[0] {
+	if !opts.SkipPrecheck {
 		// 首次开启：尝试运行一次解密，验证环境和密钥是否正常
 		log.Info().Msg("[autodecrypt] 开始全量预检 DecryptDBFiles")
 		if err := m.DecryptDBFiles(); err != nil {
