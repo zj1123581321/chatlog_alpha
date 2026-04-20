@@ -43,6 +43,15 @@ type Snapshot struct {
 	LastSession         time.Time
 }
 
+// 包级 funcVar：默认指向真实实现，单测可替换为 stub。
+//
+// 抽出这两个 hook 是为了能在测试里注入"慢 walk"模拟 GetDirSize 跑数秒的真实场景，
+// 验证 inflight guard 不会让多个 walk 并发抢 IO（见 refresh_dirsize_test.go）。
+var (
+	getDataDirSizeFn = util.GetDirSize
+	getWorkDirSizeFn = util.GetDirSize
+)
+
 // Context is the shared application state for chatlog.
 // All fields are private and must be accessed through thread-safe getter/setter methods.
 type Context struct {
@@ -61,6 +70,14 @@ type Context struct {
 	dataKey     string
 	dataUsage   string
 	imgKey      string
+
+	// dataUsage / workUsage 的 in-flight guard：避免 TUI 每秒 Refresh 时反复
+	// spawn GetDirSize goroutine。GetDirSize 递归 walk 整个目录树（dataDir 含
+	// msg/attach 10 万+ 文件，单次扫描可能几秒到几十秒），如果不 guard，walk
+	// 期间会被反复 spawn 出 N 个并发 walk，与微信 IO 严重争抢 → 用户打开新
+	// 图片卡顿 3-5s。fix(2026-04-20)
+	dataUsageInFlight bool
+	workUsageInFlight bool
 
 	// work directory state
 	workDir   string
@@ -199,24 +216,38 @@ func (c *Context) refresh() {
 			c.dataDir = c.current.DataDir
 		}
 	}
-	if c.dataUsage == "" && c.dataDir != "" {
+	if c.dataUsage == "" && !c.dataUsageInFlight && c.dataDir != "" {
+		c.dataUsageInFlight = true
 		dataDir := c.dataDir
 		go func() {
-			size := util.GetDirSize(dataDir)
+			var size string
+			// WithBackgroundIO：walk 跑在低 I/O 优先级的锁定 OS 线程上，让位微信。
+			// 错误吞掉：即使设置失败，walk 本身也会跑（fn 始终被执行）。
+			_ = util.WithBackgroundIO(func() error {
+				size = getDataDirSizeFn(dataDir)
+				return nil
+			})
 			c.mu.Lock()
 			c.dataUsage = size
+			c.dataUsageInFlight = false
 			c.mu.Unlock()
 		}()
 	}
-	if c.workUsage == "" && c.workDir != "" {
+	if c.workUsage == "" && !c.workUsageInFlight && c.workDir != "" {
+		c.workUsageInFlight = true
 		workDir := c.workDir
 		go func() {
-			workSize := util.GetDirSize(workDir)
-			cacheDir := filecopy.GetCacheDir()
-			cacheSize := util.GetDirSize(cacheDir)
-			result := fmt.Sprintf("%s (Cache: %s)", workSize, cacheSize)
+			var result string
+			_ = util.WithBackgroundIO(func() error {
+				workSize := getWorkDirSizeFn(workDir)
+				cacheDir := filecopy.GetCacheDir()
+				cacheSize := getWorkDirSizeFn(cacheDir)
+				result = fmt.Sprintf("%s (Cache: %s)", workSize, cacheSize)
+				return nil
+			})
 			c.mu.Lock()
 			c.workUsage = result
+			c.workUsageInFlight = false
 			c.mu.Unlock()
 		}()
 	}
