@@ -61,6 +61,11 @@ type Service struct {
 	// phaseState 显式追踪自动解密生命周期（Idle/Precheck/FirstFull/Live/Failed/Stopping）
 	// + 上次运行摘要。消费者：TUI 状态栏 / HTTP /status / HTTP 503 gate。
 	phaseState phaseState
+
+	// progressPub 向多消费者（TUI / 结构化日志 / HTTP status）广播首次全量
+	// 解密进度。nil-safe：publishProgress 内部判 nil。每次 StartAutoDecrypt
+	// 刷新一次（上次 Stop 已 Close 旧 publisher）。
+	progressPub *ProgressPublisher
 }
 
 // stopTimeout 是 StopAutoDecrypt 等待后台 goroutine 清理的最长时间。
@@ -106,7 +111,47 @@ func NewService(conf Config) *Service {
 		decryptCtx:     ctx,
 		decryptCancel:  cancel,
 		phaseState:     newPhaseState(),
+		progressPub:    NewProgressPublisher(),
 	}
+}
+
+// Subscribe 返回一个接收自动解密进度事件的 channel 和 cancel 闭包。
+// 订阅者独立 cap=1 chan，慢消费者丢旧保新。详见 ProgressPublisher。
+//
+// Publisher 在 Service 初始化时创建；StopAutoDecrypt 会 Close 后重建
+// （确保 TUI/HTTP 订阅者能优雅退出）。
+func (s *Service) Subscribe() (<-chan ProgressEvent, func()) {
+	s.mutex.Lock()
+	pub := s.progressPub
+	s.mutex.Unlock()
+	if pub == nil {
+		// 防御：理论上 NewService 已 alloc。给个即时 close 的 chan 避免 nil crash。
+		ch := make(chan ProgressEvent)
+		close(ch)
+		return ch, func() {}
+	}
+	return pub.Subscribe()
+}
+
+// publishProgress 是内部 helper：nil-safe 地向 progressPub 发送一个事件。
+// Phase 自动从 s.GetPhase() 读取。
+func (s *Service) publishProgress(done, total int, bytesDone, bytesTotal int64, currentFile string, startedAt time.Time) {
+	s.mutex.Lock()
+	pub := s.progressPub
+	s.mutex.Unlock()
+	if pub == nil {
+		return
+	}
+	pub.Publish(ProgressEvent{
+		Phase:       s.GetPhase(),
+		FilesDone:   done,
+		FilesTotal:  total,
+		BytesDone:   bytesDone,
+		BytesTotal:  bytesTotal,
+		CurrentFile: currentFile,
+		StartedAt:   startedAt,
+		UpdatedAt:   time.Now(),
+	})
 }
 
 // acquireDecryptSlot blocks until a decrypt slot is available.
@@ -199,10 +244,13 @@ func (s *Service) GetImageKey(info *wechat.Account) (string, error) {
 }
 
 func (s *Service) StartAutoDecrypt() error {
-	// 如果上次 Stop 已 cancel 了 ctx，重建一份供本轮 goroutine 使用。
+	// 如果上次 Stop 已 cancel 了 ctx / closed 了 publisher，重建一份供本轮使用。
 	s.mutex.Lock()
 	if s.decryptCtx == nil || s.decryptCtx.Err() != nil {
 		s.decryptCtx, s.decryptCancel = context.WithCancel(context.Background())
+	}
+	if s.progressPub == nil {
+		s.progressPub = NewProgressPublisher()
 	}
 	s.mutex.Unlock()
 
@@ -263,6 +311,16 @@ func (s *Service) StopAutoDecrypt() error {
 		log.Warn().
 			Dur("timeout", stopTimeout).
 			Msg("[autodecrypt] StopAutoDecrypt 等待后台 goroutine 超时，部分任务可能仍在跑")
+	}
+
+	// 4. Close progress publisher：所有订阅者（TUI/日志/HTTP）range 自然退出。
+	// 下次 StartAutoDecrypt 会重建新 publisher。
+	s.mutex.Lock()
+	pub := s.progressPub
+	s.progressPub = nil
+	s.mutex.Unlock()
+	if pub != nil {
+		pub.Close()
 	}
 
 	return nil
@@ -562,17 +620,42 @@ func (s *Service) DecryptDBFiles() error {
 		return filepath.Base(dbFiles[i]) < filepath.Base(dbFiles[j])
 	})
 
+	// 预扫文件大小供 ETA 计算（byte-based，Codex T5 决策）。
+	// filepath.WalkDir 对 db_storage 几十个文件几乎零开销。
+	fileSizes := make(map[string]int64, len(dbFiles))
+	var totalBytes int64
+	for _, f := range dbFiles {
+		if info, err := os.Stat(f); err == nil {
+			fileSizes[f] = info.Size()
+			totalBytes += info.Size()
+		}
+	}
+
+	startedAt := time.Now()
+	// 发布一条"开始"事件：FilesDone=0，CurrentFile 空
+	s.publishProgress(0, len(dbFiles), 0, totalBytes, "", startedAt)
+
 	var lastErr error
+	var bytesDone int64
 	failCount := 0
 
-	for _, dbFile := range dbFiles {
+	for i, dbFile := range dbFiles {
+		// 发布"正在处理 dbFile"事件（在解密前发，订阅者能看到当前文件名）
+		s.publishProgress(i, len(dbFiles), bytesDone, totalBytes, dbFile, startedAt)
+
 		if err := s.DecryptDBFile(dbFile); err != nil {
 			log.Debug().Msgf("DecryptDBFile %s failed: %v", dbFile, err)
 			lastErr = err
 			failCount++
+			// 失败也累计字节数（ETA 继续推进）
+			bytesDone += fileSizes[dbFile]
 			continue
 		}
+		bytesDone += fileSizes[dbFile]
 	}
+
+	// 发布最终事件：FilesDone=total，CurrentFile 空表示完成
+	s.publishProgress(len(dbFiles), len(dbFiles), bytesDone, totalBytes, "", startedAt)
 
 	if len(dbFiles) > 0 && failCount == len(dbFiles) {
 		return fmt.Errorf("decryption failed for all %d files, last error: %w", len(dbFiles), lastErr)
