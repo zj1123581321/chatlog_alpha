@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,9 +61,10 @@ func (m *Manager) Run(configPath string) error {
 		return string(m.wechat.GetPhase())
 	})
 	m.http.SetAutoDecryptStatusFunc(func() http.AutoDecryptStatus {
+		phase := m.wechat.GetPhase()
 		status := http.AutoDecryptStatus{
 			Enabled: m.ctx.GetAutoDecrypt(),
-			Phase:   string(m.wechat.GetPhase()),
+			Phase:   string(phase),
 		}
 		if lr := m.wechat.GetLastRun(); lr != nil {
 			status.LastRun = &http.AutoDecryptLastRun{
@@ -71,6 +73,35 @@ func (m *Manager) Run(configPath string) error {
 				DurationSecs: lr.DurationSecs,
 				FinalPhase:   string(lr.FinalPhase),
 				Error:        lr.Error,
+			}
+		}
+		// 只在 first_full 阶段返回进度（避免 UI 在 idle/live 态显示陈旧进度）
+		if phase == wechat.PhaseFirstFull {
+			if evt := m.wechat.GetLatestProgress(); evt != nil {
+				pct := 0.0
+				if evt.BytesTotal > 0 {
+					pct = float64(evt.BytesDone) / float64(evt.BytesTotal) * 100
+				}
+				elapsed := 0.0
+				etaStr := ""
+				if !evt.StartedAt.IsZero() {
+					elapsed = time.Since(evt.StartedAt).Seconds()
+					etaStr = wechat.NewETACalculator(evt.StartedAt).Format(evt.BytesDone, evt.BytesTotal)
+				}
+				currentFile := evt.CurrentFile
+				if currentFile != "" {
+					currentFile = filepath.Base(currentFile)
+				}
+				status.Progress = &http.AutoDecryptProgress{
+					FilesDone:   evt.FilesDone,
+					FilesTotal:  evt.FilesTotal,
+					BytesDone:   evt.BytesDone,
+					BytesTotal:  evt.BytesTotal,
+					Pct:         pct,
+					CurrentFile: currentFile,
+					ElapsedSecs: elapsed,
+					ETA:         etaStr,
+				}
 			}
 		}
 		return status

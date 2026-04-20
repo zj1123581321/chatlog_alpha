@@ -17,20 +17,39 @@ type AutoDecryptLastRun struct {
 	Error        string  `json:"error,omitempty"`
 }
 
+// AutoDecryptProgress 是首次全量解密进行中的进度快照（Stage M 新增）。
+// 只在 phase==first_full 时返回；完成或 idle 时不展示（避免 UI 错位显示）。
+type AutoDecryptProgress struct {
+	FilesDone   int     `json:"files_done"`
+	FilesTotal  int     `json:"files_total"`
+	BytesDone   int64   `json:"bytes_done"`
+	BytesTotal  int64   `json:"bytes_total"`
+	Pct         float64 `json:"pct"`                    // 0-100
+	CurrentFile string  `json:"current_file,omitempty"` // basename
+	ElapsedSecs float64 `json:"elapsed_s"`
+	ETA         string  `json:"eta,omitempty"` // "计算中..." / "42s" / "约 3 分钟"
+}
+
 // AutoDecryptStatus 是 /api/v1/autodecrypt/status 的响应体。
 //
 // 典型响应：
 //
-//	phase=first_full 时：
-//	  {"enabled":true, "phase":"first_full"}  ← 首次全量进行中
-//	phase=idle 且有 last_run 时（Codex T4 决策：带 last_run 摘要）：
-//	  {"enabled":false, "phase":"idle",
+//	phase=first_full 进行中：
+//	  {"enabled":true,"phase":"first_full",
+//	   "progress":{"files_done":12,"files_total":42,"pct":28.5,
+//	               "bytes_done":1234567,"bytes_total":4500000,
+//	               "current_file":"message_3.db","elapsed_s":120,
+//	               "eta":"约 5 分钟"}}
+//
+//	phase=idle 且有 last_run（Codex T4 决策：带 last_run 摘要）：
+//	  {"enabled":false,"phase":"idle",
 //	   "last_run":{"started_at":"2026-04-20T03:42:58Z",
-//	               "duration_s":420, "final_phase":"live"}}
+//	               "duration_s":420,"final_phase":"live"}}
 type AutoDecryptStatus struct {
-	Enabled bool                `json:"enabled"`
-	Phase   string              `json:"phase"`
-	LastRun *AutoDecryptLastRun `json:"last_run,omitempty"`
+	Enabled  bool                 `json:"enabled"`
+	Phase    string               `json:"phase"`
+	LastRun  *AutoDecryptLastRun  `json:"last_run,omitempty"`
+	Progress *AutoDecryptProgress `json:"progress,omitempty"`
 }
 
 // AutoDecryptStatusGetter 由 manager 注入，动态返回当前快照。

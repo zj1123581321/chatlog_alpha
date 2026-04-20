@@ -188,6 +188,18 @@ func (s *Service) spawnProgressLogger() {
 	}()
 }
 
+// GetLatestProgress 返回最近一次 publishProgress 的事件快照，nil 表示尚未发布。
+// 供 HTTP /status 等 poll-based 消费者取当前进度。
+func (s *Service) GetLatestProgress() *ProgressEvent {
+	s.mutex.Lock()
+	pub := s.progressPub
+	s.mutex.Unlock()
+	if pub == nil {
+		return nil
+	}
+	return pub.Latest()
+}
+
 // publishProgress 是内部 helper：nil-safe 地向 progressPub 发送一个事件。
 // Phase 自动从 s.GetPhase() 读取。
 func (s *Service) publishProgress(done, total int, bytesDone, bytesTotal int64, currentFile string, startedAt time.Time) {

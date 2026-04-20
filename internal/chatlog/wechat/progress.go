@@ -32,6 +32,7 @@ type ProgressPublisher struct {
 	mu     sync.RWMutex
 	subs   []chan ProgressEvent
 	closed bool
+	latest *ProgressEvent // 最近一次 Publish 的快照，供 poll-based 消费者取
 }
 
 // NewProgressPublisher 构造一个空的发布者。调用方应在任务结束时 Close()。
@@ -76,15 +77,18 @@ func (p *ProgressPublisher) Subscribe() (<-chan ProgressEvent, func()) {
 // 对每个订阅者：若 chan 满则丢弃旧值再塞新值（keep-latest）。
 // Close 后的 Publish 是 no-op（不 panic）。
 func (p *ProgressPublisher) Publish(e ProgressEvent) {
-	p.mu.RLock()
+	// 升级到写锁以更新 latest snapshot，和 subs 快照复制一起做。
+	p.mu.Lock()
 	if p.closed {
-		p.mu.RUnlock()
+		p.mu.Unlock()
 		return
 	}
+	cp := e
+	p.latest = &cp
 	// 复制订阅者快照避免在发布期间持锁（防止慢订阅者被 drain 时阻塞其他订阅者）
 	subs := make([]chan ProgressEvent, len(p.subs))
 	copy(subs, p.subs)
-	p.mu.RUnlock()
+	p.mu.Unlock()
 
 	for _, ch := range subs {
 		select {
@@ -103,6 +107,19 @@ func (p *ProgressPublisher) Publish(e ProgressEvent) {
 			}
 		}
 	}
+}
+
+// Latest 返回最近一次 Publish 的事件快照。HTTP /status 等 poll-based
+// 消费者通过它拿"当前进度"而不必维持长期订阅。
+// 从未 Publish 过时返回 nil。
+func (p *ProgressPublisher) Latest() *ProgressEvent {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.latest == nil {
+		return nil
+	}
+	cp := *p.latest
+	return &cp
 }
 
 // Close 关闭所有订阅者 chan。幂等。
