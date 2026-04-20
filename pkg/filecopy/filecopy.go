@@ -847,11 +847,9 @@ func (fm *FileCopyManager) GetTempCopy(originalPath string) (string, error) {
 	// Update last access time for TTL cleanup (no lock needed for time.Time)
 	fm.lastAccess = now
 
-	// Generate expected content hash for comparison
-	expectedDataHash, err := fm.hashFileContent(originalPath, currentSize)
-	if err != nil {
-		expectedDataHash = fmt.Sprintf("%x", currentSize+currentModTime.UnixNano())[:16]
-	}
+	// Cache key 的 data version 部分用 size+mtime 而非 content hash（避免每次
+	// cache lookup 都读整个文件，见 dataVersionKey 注释）。
+	expectedDataHash := fm.dataVersionKey(currentSize, currentModTime)
 
 	// Strategy 1: Check index for existing file using unified cache key
 	baseName := fm.extractBaseName(originalPath)
@@ -987,14 +985,9 @@ func (fm *FileCopyManager) generateTempPath(originalPath string) string {
 			fm.instanceID, baseName, strings.TrimPrefix(fileExt, "."), pathHash, dataHash, fileExt))
 	}
 
-	// Generate content hash for file integrity verification
-	dataHash, err := fm.hashFileContent(originalPath, stat.Size())
-	if err != nil {
-		// Fallback to size+modtime hash if content hashing fails
-		dataHash = fmt.Sprintf("%x", stat.Size()+stat.ModTime().UnixNano())[:16]
-	} else if len(dataHash) > 16 {
-		dataHash = dataHash[:16] // Truncate to reasonable length
-	}
+	// 用 size+mtime 作为 temp 文件名的 data version 部分。原来用 xxhash 读整
+	// 个文件，启动阶段被 42+ 个 db 文件拖到分钟级（见 dataVersionKey 注释）。
+	dataHash := fm.dataVersionKey(stat.Size(), stat.ModTime())
 
 	// Clean extension (remove dot)
 	cleanExt := strings.TrimPrefix(fileExt, ".")
@@ -1086,7 +1079,27 @@ func (fm *FileCopyManager) generateVersionKey(instanceID, baseName, ext, pathHas
 	return instanceID + "_" + baseName + "_" + ext + "_" + pathHash
 }
 
+// dataVersionKey 返回一个基于 size+mtime 的稳定版本标识，作为 cache key 的
+// 一部分。
+//
+// 设计理由：原 hashFileContent 方案每次 cache lookup 都要读整个文件算 xxhash，
+// 对 SQLite workdir 里几十个 GB 级 db 来说，启动时间直接被拖到 1 分钟+
+// （42 文件 × 几 GB × 500MB/s = 分钟级 IO）。cache lookup 成本 >= 文件大小，
+// cache 反而拖慢。
+//
+// 换成 size+mtime：
+//   - os.Stat 是 <1ms，对 42 文件无感
+//   - SQLite 数据库写入必然更新 mtime（WAL checkpoint / 主库 fsync），和
+//     content hash 在"文件是否变了"这个语义上等价
+//   - 极端 corner case（有人手动 touch 改 mtime 但不改内容 / 改内容但保持
+//     mtime）在自动解密场景下不会发生，其他合法场景也不构成风险
+func (fm *FileCopyManager) dataVersionKey(size int64, modTime time.Time) string {
+	return fmt.Sprintf("%x", size+modTime.UnixNano())[:16]
+}
+
 // hashFileContent generates a fast hash of file content for integrity verification.
+// NOTE: 已不再用于 cache key（参见 dataVersionKey 注释）。保留函数以供未来
+// 真正需要 content integrity 验证的场景（例如人工触发的 verify 命令）。
 // Uses xxhash for complete file hashing, providing excellent performance (7120+ MB/s).
 func (fm *FileCopyManager) hashFileContent(filePath string, _ int64) (string, error) {
 	file, err := os.Open(filePath)
