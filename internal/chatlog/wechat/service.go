@@ -57,6 +57,10 @@ type Service struct {
 	// decryptWg 追踪所有在跑的 autodecrypt goroutine。Stop 时 cancel + Wait(5s)
 	// 保证切账号 / 退出 TUI 时不会泄漏 goroutine 到新上下文。
 	decryptWg sync.WaitGroup
+
+	// phaseState 显式追踪自动解密生命周期（Idle/Precheck/FirstFull/Live/Failed/Stopping）
+	// + 上次运行摘要。消费者：TUI 状态栏 / HTTP /status / HTTP 503 gate。
+	phaseState phaseState
 }
 
 // stopTimeout 是 StopAutoDecrypt 等待后台 goroutine 清理的最长时间。
@@ -101,6 +105,7 @@ func NewService(conf Config) *Service {
 		decryptSem:     make(chan struct{}, 1),
 		decryptCtx:     ctx,
 		decryptCancel:  cancel,
+		phaseState:     newPhaseState(),
 	}
 }
 
