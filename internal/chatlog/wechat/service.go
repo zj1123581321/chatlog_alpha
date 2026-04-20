@@ -214,7 +214,11 @@ func (s *Service) StartAutoDecrypt() error {
 	// Always monitor WAL files since WeChat uses WAL mode regardless of our setting.
 	// When WalEnabled is false, WAL changes still trigger a full re-decrypt of the main .db file.
 	pattern := `.*\.db(-wal|-shm)?$`
-	dbGroup, err := filemonitor.NewFileGroup("wechat", s.conf.GetDataDir(), pattern, []string{"fts"})
+	// rootDir 窄化到 db_storage 子目录：data dir 下 msg/attach/ 有 9.6 万+ 图片文件，
+	// filemonitor 初始化会 fs.WalkDir 整个 rootDir 找匹配 .db 的目录，实测整个 data dir
+	// 要 17 秒；窄化到 db_storage (仅几十个 .db 文件) <2 秒。所有微信 db 都在这里。
+	dbStorage := filepath.Join(s.conf.GetDataDir(), "db_storage")
+	dbGroup, err := filemonitor.NewFileGroup("wechat", dbStorage, pattern, []string{"fts"})
 	if err != nil {
 		return err
 	}
@@ -537,7 +541,10 @@ func isWalFile(path string) bool {
 }
 
 func (s *Service) DecryptDBFiles() error {
-	dbGroup, err := filemonitor.NewFileGroup("wechat", s.conf.GetDataDir(), `.*\.db$`, []string{"fts"})
+	// 同 StartAutoDecrypt：rootDir 窄化到 db_storage 避免 fs.WalkDir 遍历
+	// 整个 data dir (msg/attach/ 9.6 万图片) 导致 10+ 秒 overhead。
+	dbStorage := filepath.Join(s.conf.GetDataDir(), "db_storage")
+	dbGroup, err := filemonitor.NewFileGroup("wechat", dbStorage, `.*\.db$`, []string{"fts"})
 	if err != nil {
 		return err
 	}
