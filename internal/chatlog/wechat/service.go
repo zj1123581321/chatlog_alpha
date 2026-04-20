@@ -708,10 +708,21 @@ func (s *Service) DecryptDBFiles() error {
 	var lastErr error
 	var bytesDone int64
 	failCount := 0
+	skipCount := 0
 
 	for i, dbFile := range dbFiles {
 		// 发布"正在处理 dbFile"事件（在解密前发，订阅者能看到当前文件名）
 		s.publishProgress(i, len(dbFiles), bytesDone, totalBytes, dbFile, startedAt)
+
+		// Skip 检查：workdir 副本的 mtime 不早于 source，视为已是最新。
+		// 把"首次全量"从"每次重解所有 db"改为"增量追赶上次关机后微信改过的 db"。
+		// 多数情况下（两次 chatlog 启动之间微信没大量活动），大部分 db 被 skip。
+		if s.isWorkCopyUpToDate(dbFile) {
+			log.Debug().Str("file", filepath.Base(dbFile)).Msg("[autodecrypt] workdir 副本已最新，skip")
+			skipCount++
+			bytesDone += fileSizes[dbFile]
+			continue
+		}
 
 		if err := s.DecryptDBFile(dbFile); err != nil {
 			log.Debug().Msgf("DecryptDBFile %s failed: %v", dbFile, err)
@@ -723,6 +734,14 @@ func (s *Service) DecryptDBFiles() error {
 		}
 		bytesDone += fileSizes[dbFile]
 	}
+
+	log.Info().
+		Int("total", len(dbFiles)).
+		Int("skipped_up_to_date", skipCount).
+		Int("failed", failCount).
+		Int("decrypted", len(dbFiles)-skipCount-failCount).
+		Dur("elapsed", time.Since(startedAt)).
+		Msg("[autodecrypt] DecryptDBFiles 汇总")
 
 	// 发布最终事件：FilesDone=total，CurrentFile 空表示完成
 	s.publishProgress(len(dbFiles), len(dbFiles), bytesDone, totalBytes, "", startedAt)
