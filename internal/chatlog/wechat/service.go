@@ -46,7 +46,23 @@ type Service struct {
 	fm             *filemonitor.FileMonitor
 	errorHandler   func(error)
 	decryptSem     chan struct{}
+
+	// decryptCtx 是所有 autodecrypt 后台 goroutine（waitAndProcess 以及 Stage G
+	// 的 firstFullDecrypt）共享的取消上下文。StopAutoDecrypt 时 cancel，让长
+	// backoff sleep 和未来的 blocking op 能及时退出。每次 StartAutoDecrypt
+	// 刷新一次（旧 ctx 已被上次 Stop 取消）。
+	decryptCtx    context.Context
+	decryptCancel context.CancelFunc
+
+	// decryptWg 追踪所有在跑的 autodecrypt goroutine。Stop 时 cancel + Wait(5s)
+	// 保证切账号 / 退出 TUI 时不会泄漏 goroutine 到新上下文。
+	decryptWg sync.WaitGroup
 }
+
+// stopTimeout 是 StopAutoDecrypt 等待后台 goroutine 清理的最长时间。
+// 超时后打 warn 日志但继续返回 —— 不阻塞切账号 / 退出动作。
+// 用 var 而非 const 方便单测注入更短值。
+var stopTimeout = 5 * time.Second
 
 type pendingEvent struct {
 	sawDB  bool
@@ -75,6 +91,7 @@ type Config interface {
 }
 
 func NewService(conf Config) *Service {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
 		conf:           conf,
 		lastEvents:     make(map[string]time.Time),
@@ -82,6 +99,8 @@ func NewService(conf Config) *Service {
 		pendingEvents:  make(map[string]*pendingEvent),
 		walStates:      make(map[string]*walState),
 		decryptSem:     make(chan struct{}, 1),
+		decryptCtx:     ctx,
+		decryptCancel:  cancel,
 	}
 }
 
@@ -175,6 +194,13 @@ func (s *Service) GetImageKey(info *wechat.Account) (string, error) {
 }
 
 func (s *Service) StartAutoDecrypt() error {
+	// 如果上次 Stop 已 cancel 了 ctx，重建一份供本轮 goroutine 使用。
+	s.mutex.Lock()
+	if s.decryptCtx == nil || s.decryptCtx.Err() != nil {
+		s.decryptCtx, s.decryptCancel = context.WithCancel(context.Background())
+	}
+	s.mutex.Unlock()
+
 	log.Info().
 		Str("data_dir", s.conf.GetDataDir()).
 		Dur("quiet_period", s.getDebounceTime()).
@@ -199,12 +225,37 @@ func (s *Service) StartAutoDecrypt() error {
 }
 
 func (s *Service) StopAutoDecrypt() error {
+	// 1. 停文件监听 —— 不再 spawn 新的 waitAndProcess
 	if s.fm != nil {
 		if err := s.fm.Stop(); err != nil {
 			return err
 		}
 	}
 	s.fm = nil
+
+	// 2. cancel 后台 goroutine 的 ctx，唤醒 retryOnFileLockCtx 的 backoff sleep
+	s.mutex.Lock()
+	cancel := s.decryptCancel
+	s.mutex.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	// 3. Wait(5s) 让 inflight goroutine 优雅退出；超时则 warn 但不阻塞切账号
+	done := make(chan struct{})
+	go func() {
+		s.decryptWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Debug().Msg("[autodecrypt] StopAutoDecrypt 所有 goroutine 已退出")
+	case <-time.After(stopTimeout):
+		log.Warn().
+			Dur("timeout", stopTimeout).
+			Msg("[autodecrypt] StopAutoDecrypt 等待后台 goroutine 超时，部分任务可能仍在跑")
+	}
+
 	return nil
 }
 
@@ -239,7 +290,12 @@ func (s *Service) DecryptFileCallback(event fsnotify.Event) error {
 	if !s.pendingActions[dbFile] {
 		s.pendingActions[dbFile] = true
 		s.mutex.Unlock()
-		go s.waitAndProcess(dbFile)
+		// wg.Add 必须在 spawn 之前，避免 Stop.Wait 在 Add 之前跑完导致 goroutine 未被追踪
+		s.decryptWg.Add(1)
+		go func() {
+			defer s.decryptWg.Done()
+			s.waitAndProcess(dbFile)
+		}()
 	} else {
 		s.mutex.Unlock()
 	}
@@ -315,7 +371,7 @@ func (s *Service) waitAndProcess(dbFile string) {
 					}
 				}
 				// Full re-decrypt: new file, checkpoint update, or incremental failed
-				err := retryOnFileLock(func() error {
+				err := retryOnFileLockCtx(s.decryptCtx, func() error {
 					return s.DecryptDBFile(dbFile)
 				}, decryptRetryAttempts, decryptRetryBaseDelay)
 				if err != nil {
@@ -345,7 +401,7 @@ func (s *Service) waitAndProcess(dbFile string) {
 				return
 			}
 			if !s.conf.GetWalEnabled() || !workCopyExists {
-				err := retryOnFileLock(func() error {
+				err := retryOnFileLockCtx(s.decryptCtx, func() error {
 					return s.DecryptDBFile(dbFile)
 				}, decryptRetryAttempts, decryptRetryBaseDelay)
 				if err != nil {
@@ -359,9 +415,10 @@ func (s *Service) waitAndProcess(dbFile string) {
 }
 
 // retryDecrypt wraps IncrementalDecryptDBFile-style functions with file lock retry.
+// 使用 Service.decryptCtx 让 Stop() 能 cancel 长 backoff sleep。
 func (s *Service) retryDecrypt(op func() (bool, error)) (bool, error) {
 	var handled bool
-	err := retryOnFileLock(func() error {
+	err := retryOnFileLockCtx(s.decryptCtx, func() error {
 		var e error
 		handled, e = op()
 		return e
