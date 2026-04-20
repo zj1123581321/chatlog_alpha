@@ -54,6 +54,28 @@ func (m *Manager) Run(configPath string) error {
 
 	m.http = http.NewService(m.ctx, m.db)
 
+	// 注入 autodecrypt phase/status 查询闭包 —— 用于 HTTP 503 gate 和 /status 接口。
+	// Stage H (Codex Tension #1): 首次全量期间 /api/v1/chatlog 等读接口返 503。
+	m.http.SetAutoDecryptPhaseFunc(func() string {
+		return string(m.wechat.GetPhase())
+	})
+	m.http.SetAutoDecryptStatusFunc(func() http.AutoDecryptStatus {
+		status := http.AutoDecryptStatus{
+			Enabled: m.ctx.GetAutoDecrypt(),
+			Phase:   string(m.wechat.GetPhase()),
+		}
+		if lr := m.wechat.GetLastRun(); lr != nil {
+			status.LastRun = &http.AutoDecryptLastRun{
+				StartedAt:    lr.StartedAt.Format(time.RFC3339),
+				EndedAt:      lr.EndedAt.Format(time.RFC3339),
+				DurationSecs: lr.DurationSecs,
+				FinalPhase:   string(lr.FinalPhase),
+				Error:        lr.Error,
+			}
+		}
+		return status
+	})
+
 	m.ctx.SetWeChatInstances(m.wechat.GetWeChatInstances())
 	instances := m.ctx.GetWeChatInstances()
 	if len(instances) >= 1 {

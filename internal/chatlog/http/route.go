@@ -70,7 +70,18 @@ func (s *Service) initMediaRouter() {
 }
 
 func (s *Service) initAPIRouter() {
-	api := s.router.Group("/api/v1", s.checkDBStateMiddleware())
+	// firstFullGateMiddleware 在首次全量期间返 503，避免读数据接口返回跨 db
+	// 不一致的时间线。/autodecrypt/status 和 /cache/clear 通过 skipPaths 白名单豁免。
+	//
+	// 用闭包动态读 s.autoDecryptPhaseFn，因为 manager 可能在 initAPIRouter 之后
+	// 才调 SetAutoDecryptPhaseFunc 注入。
+	phaseLookup := func() string {
+		if s.autoDecryptPhaseFn == nil {
+			return ""
+		}
+		return s.autoDecryptPhaseFn()
+	}
+	api := s.router.Group("/api/v1", s.checkDBStateMiddleware(), firstFullGateMiddleware(phaseLookup))
 	{
 		api.GET("/chatlog", s.handleChatlog)
 		api.GET("/contact", s.handleContacts)
@@ -82,6 +93,7 @@ func (s *Service) initAPIRouter() {
 		api.GET("/db/data", s.handleGetDBTableData)
 		api.GET("/db/query", s.handleExecuteSQL)
 		api.POST("/cache/clear", s.handleClearCache)
+		api.GET("/autodecrypt/status", s.handleAutoDecryptStatus)
 	}
 }
 

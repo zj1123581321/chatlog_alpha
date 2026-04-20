@@ -45,6 +45,24 @@ type Service struct {
 
 	// backup 请求来源分布统计 (原子计数), 暴露给 /api/v1/backup/stats
 	backupStats backupStats
+
+	// autoDecryptPhaseFn 返回当前自动解密 phase 字符串（"idle" / "first_full" / 等）。
+	// 由 manager 启动后 SetAutoDecryptPhaseFunc 注入。nil 时 gate middleware 直通。
+	//
+	// 作用：Codex outside voice Tension #1 "输出一致性契约" 的解法 ——
+	// 首次全量（phase=="first_full"）期间 /api/v1/chatlog 等读数据接口返 503，
+	// 避免 HTTP 消费者看到跨 db 新旧混合的时间线断层。
+	autoDecryptPhaseFn func() string
+
+	// autoDecryptStatusFn 返回完整 status snapshot，供 /api/v1/autodecrypt/status
+	// 消费。phase / enabled / last_run 都在里面。
+	autoDecryptStatusFn AutoDecryptStatusGetter
+}
+
+// SetAutoDecryptPhaseFunc 注入 phase 查询闭包，用于 503 gate middleware。
+// 幂等：多次调用覆盖前值。传 nil 禁用 gate（测试场景）。
+func (s *Service) SetAutoDecryptPhaseFunc(fn func() string) {
+	s.autoDecryptPhaseFn = fn
 }
 
 type Config interface {
