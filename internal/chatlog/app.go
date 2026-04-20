@@ -199,14 +199,12 @@ func (a *App) refresh() {
 				httpServerText = fmt.Sprintf("[green][已启动][white] [%s]", snap.HTTPAddr)
 			}
 
-			autoDecryptText := "[未开启]"
-			if snap.AutoDecrypt {
-				if snap.AutoDecryptDebounce > 0 {
-					autoDecryptText = fmt.Sprintf("[green][已开启][white] %dms", snap.AutoDecryptDebounce)
-				} else {
-					autoDecryptText = "[green][已开启][white]"
-				}
-			}
+			autoDecryptText := buildAutoDecryptText(
+				a.m.GetAutoDecryptPhase(),
+				a.m.GetAutoDecryptProgress(),
+				snap.AutoDecrypt,
+				snap.AutoDecryptDebounce,
+			)
 
 			walText := "[未启用]"
 			if snap.WalEnabled {

@@ -506,6 +506,18 @@ func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
 	return nil
 }
 
+// GetAutoDecryptPhase 返回当前自动解密 lifecycle phase。
+// 供 TUI 状态栏 / 其他需要根据 phase 分支 UI 的消费者读取。
+func (m *Manager) GetAutoDecryptPhase() wechat.AutoDecryptPhase {
+	return m.wechat.GetPhase()
+}
+
+// GetAutoDecryptProgress 返回首次全量解密的最新进度快照。
+// 非 first_full 阶段可能返回 nil（取决于 publisher 状态）。
+func (m *Manager) GetAutoDecryptProgress() *wechat.ProgressEvent {
+	return m.wechat.GetLatestProgress()
+}
+
 func (m *Manager) StopAutoDecrypt() error {
 	if err := m.wechat.StopAutoDecrypt(); err != nil {
 		return err
