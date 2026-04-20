@@ -15,8 +15,8 @@ import (
 //	Idle + !enabled           "[未开启]"
 //	Idle + enabled (瞬时)     "[恢复中]"      recovery 路径的短窗口
 //	Precheck                  "[预检中]"       ~1-2s
-//	FirstFull + 有进度         "[首次全量] 12/42 (28%, 约 5 分钟)"
-//	FirstFull 无进度快照        "[首次全量] 准备中..."
+//	FirstFull + 有进度         "[数据同步] 12/42 (28%, 约 5 分钟)"
+//	FirstFull 无进度快照        "[数据同步] 准备中..."
 //	Live                      "[已开启]" 或 "[已开启] 60000ms"
 //	Failed                    "[已失败]"
 //	Stopping                  "[停止中]"
@@ -32,7 +32,7 @@ func buildAutoDecryptText(
 
 	case wechat.PhaseFirstFull:
 		if progress == nil || progress.BytesTotal <= 0 {
-			return "[yellow][首次全量][white] 准备中..."
+			return "[yellow][数据同步][white] 准备中..."
 		}
 		pct := float64(progress.BytesDone) / float64(progress.BytesTotal) * 100
 		etaStr := ""
@@ -40,10 +40,10 @@ func buildAutoDecryptText(
 			etaStr = wechat.NewETACalculator(progress.StartedAt).Format(progress.BytesDone, progress.BytesTotal)
 		}
 		if etaStr != "" {
-			return fmt.Sprintf("[yellow][首次全量][white] %d/%d (%.0f%%, %s)",
+			return fmt.Sprintf("[yellow][数据同步][white] %d/%d (%.0f%%, %s)",
 				progress.FilesDone, progress.FilesTotal, pct, etaStr)
 		}
-		return fmt.Sprintf("[yellow][首次全量][white] %d/%d (%.0f%%)",
+		return fmt.Sprintf("[yellow][数据同步][white] %d/%d (%.0f%%)",
 			progress.FilesDone, progress.FilesTotal, pct)
 
 	case wechat.PhaseLive:

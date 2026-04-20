@@ -32,8 +32,8 @@ func TestBuildAutoDecryptText_Precheck(t *testing.T) {
 
 func TestBuildAutoDecryptText_FirstFull_NoProgress(t *testing.T) {
 	got := buildAutoDecryptText(wechat.PhaseFirstFull, nil, true, 0)
-	if !strings.Contains(got, "首次全量") || !strings.Contains(got, "准备中") {
-		t.Errorf("got %q, should show 首次全量 + 准备中", got)
+	if !strings.Contains(got, "数据同步") || !strings.Contains(got, "准备中") {
+		t.Errorf("got %q, should show 数据同步 + 准备中", got)
 	}
 }
 

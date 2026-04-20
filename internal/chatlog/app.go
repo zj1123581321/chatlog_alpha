@@ -483,7 +483,7 @@ func (a *App) initMenu() {
 							modal.SetText("开启自动解密失败: " + err.Error())
 						} else {
 							// 开启成功：Stage G 之后 UI 秒级返回，首次全量在后台跑
-							modal.SetText("已开启自动解密\n（首次全量解密将在后台进行，详情见状态栏 / 日志）")
+							modal.SetText("已开启自动解密\n（数据同步将在后台进行，详情见状态栏 / 日志）")
 						}
 						log.Info().Msg("[autodecrypt] modal.SetText 完成，调用 updateMenuItemsState")
 
