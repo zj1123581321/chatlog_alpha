@@ -494,15 +494,21 @@ func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
 
 	m.ctx.SetAutoDecrypt(true)
 
-	// Stage G: UI 路径 fire-and-forget 首次全量。recovery 路径 workdir 已有数据直接 Live。
+	// UI 按钮路径 + recovery 路径都 spawn firstFullDecrypt。原 CEO plan E2
+	// "recovery 路径复用 progress channel" 在 PR#1/PR#2 阶段被判错为 no-op
+	// (以为 recovery 不需要解密)，但会留下 "用户停机期间微信写入的 db 在 recovery
+	// 后无法追赶" 缺口 —— 只有下次微信主动写才会触发 fsnotify 解密。
+	//
+	// 现在让 recovery 也 spawn firstFullDecrypt。d961c69 的 skip-up-to-date 保证：
+	//   - workdir 已同步的账号 → 所有 db 被 skip, 瞬间 Live
+	//   - 有追赶需求的账号 → 只解 out-of-date 的几个 db, 几秒 Live
+	m.wechat.SetPhase(wechat.PhaseFirstFull)
 	if opts.SkipPrecheck {
-		m.wechat.SetPhase(wechat.PhaseLive)
-		log.Info().Msg("[autodecrypt] Recovery 路径直接进入 Live phase")
+		log.Info().Msg("[autodecrypt] Recovery 路径：spawn firstFullDecrypt 追赶停机期间变化（skip-up-to-date 保护）")
 	} else {
-		m.wechat.SetPhase(wechat.PhaseFirstFull)
-		log.Info().Msg("[autodecrypt] 启动后台 firstFullDecrypt goroutine")
-		m.wechat.SpawnFirstFullDecrypt(m.DecryptDBFiles)
+		log.Info().Msg("[autodecrypt] UI 路径：spawn firstFullDecrypt")
 	}
+	m.wechat.SpawnFirstFullDecrypt(m.DecryptDBFiles)
 	return nil
 }
 
