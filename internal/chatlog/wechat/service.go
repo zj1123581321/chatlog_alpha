@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -106,6 +107,29 @@ func (s *Service) handleDecryptError(err error) {
 	}
 	if s.errorHandler != nil {
 		s.errorHandler(err)
+	}
+}
+
+// recoverDecryptPanic 捕获 autodecrypt goroutine 的 panic，记录日志 + 堆栈，
+// 并触发熔断 handler 让 TUI 弹错 + SetAutoDecrypt(false)。
+//
+// 项目约定：所有 autodecrypt 相关的后台 goroutine 必须在第一条 defer 使用：
+//
+//	defer s.recoverDecryptPanic("goroutine-name")
+//
+// 避免单个 goroutine panic 炸掉整个 chatlog 进程（历史上曾有过 context 死锁
+// 和 handle 泄漏问题，长期运行稳定性容忍度低）。
+func (s *Service) recoverDecryptPanic(op string) {
+	if r := recover(); r != nil {
+		err := fmt.Errorf("autodecrypt %s goroutine panic: %v", op, r)
+		log.Error().
+			Str("op", op).
+			Interface("panic", r).
+			Bytes("stack", debug.Stack()).
+			Msg("[autodecrypt] goroutine panic recovered")
+		if s.errorHandler != nil {
+			s.errorHandler(err)
+		}
 	}
 }
 
@@ -229,6 +253,7 @@ const (
 )
 
 func (s *Service) waitAndProcess(dbFile string) {
+	defer s.recoverDecryptPanic("waitAndProcess")
 	start := time.Now()
 	for {
 		debounce := s.getDebounceTimeForFile(dbFile)
