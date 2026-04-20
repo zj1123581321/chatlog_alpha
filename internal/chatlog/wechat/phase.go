@@ -1,6 +1,7 @@
 package wechat
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -107,4 +108,53 @@ func (s *Service) setLastRun(r AutoDecryptLastRun) {
 	s.phaseState.mu.Lock()
 	defer s.phaseState.mu.Unlock()
 	s.phaseState.lastRun = &r
+}
+
+// SpawnFirstFullDecrypt 以 fire-and-forget 方式跑首次全量解密。
+//
+// 这是 Stage G 的核心：UI 按钮按下 → 预检单文件秒级返回 → SpawnFirstFullDecrypt
+// 后台跑全量，phase 进入 FirstFull。完成时自动设 Phase=Live + last_run 摘要；
+// 失败时 Phase=Failed + 熔断 handler 触发。
+//
+// decryptFn 通常是 Manager.DecryptDBFiles —— 封装后可以让 wechat 包不依赖 manager。
+//
+// 调用前提：caller 已设 Phase=FirstFull。
+// 并发保证：defer recover + wg 注册，Stop 能清理。
+func (s *Service) SpawnFirstFullDecrypt(decryptFn func() error) {
+	s.decryptWg.Add(1)
+	go func() {
+		defer s.decryptWg.Done()
+		defer s.recoverDecryptPanic("firstFullDecrypt")
+
+		started := time.Now()
+		log.Info().Msg("[autodecrypt] firstFullDecrypt goroutine 启动")
+
+		err := decryptFn()
+		duration := time.Since(started)
+
+		run := AutoDecryptLastRun{
+			StartedAt:    started,
+			EndedAt:      time.Now(),
+			DurationSecs: duration.Seconds(),
+		}
+
+		if err != nil {
+			run.FinalPhase = PhaseFailed
+			run.Error = err.Error()
+			s.setLastRun(run)
+			s.SetPhase(PhaseFailed)
+			log.Error().Err(err).Dur("duration", duration).
+				Msg("[autodecrypt] firstFullDecrypt 失败，触发熔断")
+			if s.errorHandler != nil {
+				s.errorHandler(fmt.Errorf("首次全量解密失败: %w", err))
+			}
+			return
+		}
+
+		run.FinalPhase = PhaseLive
+		s.setLastRun(run)
+		s.SetPhase(PhaseLive)
+		log.Info().Dur("duration", duration).
+			Msg("[autodecrypt] firstFullDecrypt 完成，进入 Live phase")
+	}()
 }

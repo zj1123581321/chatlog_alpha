@@ -19,6 +19,12 @@ import (
 // 调用方收到此错误应当降级走 skipPrecheck 继续启动自动解密，由运行期熔断兜底。
 var ErrNoDBFile = errors.New("no db file found for precheck")
 
+// PickSmallestDBForPrecheck 是 pickSmallestDB 的导出别名，供 manager 包调用。
+// 保留 pickSmallestDB 小写版本给 package-internal 用，避免破坏 test 可读性。
+func PickSmallestDBForPrecheck(dataDir string) (string, error) {
+	return pickSmallestDB(dataDir)
+}
+
 // pickSmallestDB 从 dataDir/db_storage 里挑一个 .db 文件用于预检解密。
 //
 // 预检目标是"解一个 db 验证密钥正确"，所以优选稳定、存在概率高、体积小的文件。

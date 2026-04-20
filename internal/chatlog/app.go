@@ -471,8 +471,9 @@ func (a *App) initMenu() {
 				// 在后台开启自动解密
 				go func() {
 					log.Info().Msg("[autodecrypt] goroutine 启动，调用 Manager.StartAutoDecrypt")
-					// 此处保持 SkipPrecheck:false（跑全量预检）。后续 Stage G 会改为
-					// SkipPrecheck:true + 单文件预检 + fire-and-forget 后台全量。
+					// Stage G 之后 UI 按钮路径：单文件预检（秒级）+ 启动文件监听 +
+					// fire-and-forget 后台首次全量。StartAutoDecrypt 秒级返回，
+					// modal 立即关闭显示"已开启"，首次全量在状态栏/日志体现。
 					err := a.m.StartAutoDecrypt(StartAutoDecryptOpts{SkipPrecheck: false})
 					log.Info().Err(err).Msg("[autodecrypt] Manager.StartAutoDecrypt 返回，准备 QueueUpdateDraw")
 
@@ -483,8 +484,8 @@ func (a *App) initMenu() {
 							// 开启失败
 							modal.SetText("开启自动解密失败: " + err.Error())
 						} else {
-							// 开启成功
-							modal.SetText("已开启自动解密")
+							// 开启成功：Stage G 之后 UI 秒级返回，首次全量在后台跑
+							modal.SetText("已开启自动解密\n（首次全量解密将在后台进行，详情见状态栏 / 日志）")
 						}
 						log.Info().Msg("[autodecrypt] modal.SetText 完成，调用 updateMenuItemsState")
 

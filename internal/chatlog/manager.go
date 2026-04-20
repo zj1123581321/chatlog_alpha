@@ -375,6 +375,14 @@ type StartAutoDecryptOpts struct {
 }
 
 // StartAutoDecrypt 开启自动解密。
+//
+// Stage G 重构：UI 按钮路径（SkipPrecheck=false）不再阻塞等全量解密，而是：
+//  1. 单文件预检（~秒级）验证密钥 → Phase: Idle → Precheck
+//  2. 启动文件监听器（~秒级）→ Phase: Precheck → FirstFull
+//  3. Fire-and-forget spawn 首次全量 goroutine → 完成后 Phase: FirstFull → Live
+//  4. 函数秒级返回，UI modal 立即关闭
+//
+// Recovery 路径（SkipPrecheck=true）跳过单文件预检，workdir 已有数据直接 Live。
 func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
 	log.Info().Bool("skip_precheck", opts.SkipPrecheck).Msg("[autodecrypt] Manager.StartAutoDecrypt 入口")
 	defer func() {
@@ -385,13 +393,27 @@ func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
 		return fmt.Errorf("请先获取密钥")
 	}
 
+	// 预检：单文件解密验证密钥（替代原先跑全量 DecryptDBFiles）
 	if !opts.SkipPrecheck {
-		// 首次开启：尝试运行一次解密，验证环境和密钥是否正常
-		log.Info().Msg("[autodecrypt] 开始全量预检 DecryptDBFiles")
-		if err := m.DecryptDBFiles(); err != nil {
-			return fmt.Errorf("初始解密失败，无法开启自动解密: %w", err)
+		m.wechat.SetPhase(wechat.PhasePrecheck)
+		log.Info().Msg("[autodecrypt] 开始单文件预检")
+		dbFile, err := wechat.PickSmallestDBForPrecheck(m.ctx.GetDataDir())
+		if err == wechat.ErrNoDBFile {
+			// 空 db_storage 目录：降级继续（比如新账号还没初始化）。
+			// 运行期熔断会在文件监听到真实 db 写入时兜底捕获密钥错。
+			log.Warn().Msg("[autodecrypt] db_storage 为空，跳过预检继续启动")
+		} else if err != nil {
+			m.wechat.SetPhase(wechat.PhaseFailed)
+			return fmt.Errorf("预检文件选择失败: %w", err)
+		} else {
+			precheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := m.wechat.DecryptSingleDBForPrecheck(precheckCtx, dbFile); err != nil {
+				m.wechat.SetPhase(wechat.PhaseFailed)
+				return fmt.Errorf("预检失败（密钥或环境错）: %w", err)
+			}
+			log.Info().Str("file", dbFile).Msg("[autodecrypt] 单文件预检通过")
 		}
-		log.Info().Msg("[autodecrypt] DecryptDBFiles 完成")
 	}
 
 	if m.ctx.GetWorkDir() == "" {
@@ -412,12 +434,22 @@ func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
 
 	log.Info().Msg("[autodecrypt] 调用 wechat.StartAutoDecrypt（启动文件监控）")
 	if err := m.wechat.StartAutoDecrypt(); err != nil {
+		m.wechat.SetPhase(wechat.PhaseFailed)
 		return err
 	}
 	log.Info().Msg("[autodecrypt] wechat.StartAutoDecrypt 返回，准备 ctx.SetAutoDecrypt(true)")
 
 	m.ctx.SetAutoDecrypt(true)
-	log.Info().Msg("[autodecrypt] ctx.SetAutoDecrypt(true) 完成（config 已持久化）")
+
+	// Stage G: UI 路径 fire-and-forget 首次全量。recovery 路径 workdir 已有数据直接 Live。
+	if opts.SkipPrecheck {
+		m.wechat.SetPhase(wechat.PhaseLive)
+		log.Info().Msg("[autodecrypt] Recovery 路径直接进入 Live phase")
+	} else {
+		m.wechat.SetPhase(wechat.PhaseFirstFull)
+		log.Info().Msg("[autodecrypt] 启动后台 firstFullDecrypt goroutine")
+		m.wechat.SpawnFirstFullDecrypt(m.DecryptDBFiles)
+	}
 	return nil
 }
 
