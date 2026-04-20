@@ -485,6 +485,14 @@ func (m *Manager) StartAutoDecrypt(opts StartAutoDecryptOpts) (retErr error) {
 		}
 	})
 
+	// 方案 4：注入微信 IO 节流器。pidProvider 用闭包延迟取，支持微信重启换 PID。
+	// PID=0 时 sampler 直接返回 (0, nil) → throttle 视为安静，不阻塞解密。
+	m.wechat.SetIoThrottle(wechat.NewIoThrottle(
+		wechat.NewGopsutilSampler(func() int32 {
+			return int32(m.ctx.GetPID())
+		}),
+	))
+
 	log.Info().Msg("[autodecrypt] 调用 wechat.StartAutoDecrypt（启动文件监控）")
 	if err := m.wechat.StartAutoDecrypt(); err != nil {
 		m.wechat.SetPhase(wechat.PhaseFailed)

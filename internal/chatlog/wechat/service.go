@@ -47,6 +47,11 @@ type Service struct {
 	errorHandler   func(error)
 	decryptSem     chan struct{}
 
+	// ioThrottle 在 acquireDecryptSlot 时让位微信高 IO（方案 4）。
+	// nil 时直接进 sem，无额外延迟（保持改造前行为）。
+	// 用 SetIoThrottle 注入；生产代码在 chatlog 启动后 wire 真实 sampler。
+	ioThrottle *IoThrottle
+
 	// decryptCtx 是所有 autodecrypt 后台 goroutine（waitAndProcess 以及 Stage G
 	// 的 firstFullDecrypt）共享的取消上下文。StopAutoDecrypt 时 cancel，让长
 	// backoff sleep 和未来的 blocking op 能及时退出。每次 StartAutoDecrypt
@@ -223,12 +228,36 @@ func (s *Service) publishProgress(done, total int, bytesDone, bytesTotal int64, 
 
 // acquireDecryptSlot blocks until a decrypt slot is available.
 // Limits concurrent decryption to 1 to minimize IO contention with WeChat.
+//
+// 方案 4 集成：在拿 slot 之前先等微信 IO 安静。throttle=nil 时跳过，
+// 行为与改造前一致。throttle 自身 maxWait 兜底（默认 30s），所以即使
+// 微信永远不安静也不会卡死解密 —— 此时方案 1（线程级 IO Priority）兜底。
 func (s *Service) acquireDecryptSlot() {
+	s.mutex.Lock()
+	throttle := s.ioThrottle
+	ctx := s.decryptCtx
+	s.mutex.Unlock()
+	if throttle != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		_ = throttle.WaitForQuiet(ctx)
+	}
 	s.decryptSem <- struct{}{}
 }
 
 func (s *Service) releaseDecryptSlot() {
 	<-s.decryptSem
+}
+
+// SetIoThrottle 注入微信 IO 节流器（方案 4）。
+// 生产代码在 wire-up 阶段（manager 拿到微信 PID 后）调用一次；
+// 测试可直接注入受控 mock sampler 的 throttle。
+// 传 nil 等同于关闭节流（fast path）。
+func (s *Service) SetIoThrottle(t *IoThrottle) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.ioThrottle = t
 }
 
 // handleDecryptError routes errors: file lock errors are logged and skipped,
@@ -563,57 +592,64 @@ func (s *Service) retryDecrypt(op func() (bool, error)) (bool, error) {
 	return handled, err
 }
 
+// DecryptDBFile 解密单个 .db 文件到 work_dir。
+//
+// 方案 1 集成：整个解密 IO 在低 I/O 优先级的锁定 OS 线程上跑（util.WithBackgroundIO），
+// Windows 内核 IO 调度器优先服务前台进程（微信）。配合方案 4（acquireDecryptSlot
+// 里的 IoThrottle）双层保险：throttle 在源头避免挤进 IO 队列；priority 在万一
+// 挤进去时让微信先走。
 func (s *Service) DecryptDBFile(dbFile string) error {
-
-	decryptor, err := decrypt.NewDecryptor(s.conf.GetPlatform(), s.conf.GetVersion())
-	if err != nil {
-		return err
-	}
-
-	relPath, err := filepath.Rel(s.conf.GetDataDir(), dbFile)
-	if err != nil {
-		return fmt.Errorf("failed to get relative path for %s: %w", dbFile, err)
-	}
-	output := filepath.Join(s.conf.GetWorkDir(), relPath)
-	if err := util.PrepareDir(filepath.Dir(output)); err != nil {
-		return err
-	}
-
-	outputTemp := output + ".tmp"
-	outputFile, err := os.Create(outputTemp)
-	if err != nil {
-		return fmt.Errorf("failed to create output file: %v", err)
-	}
-	defer func() {
-		outputFile.Close()
-		if err := os.Rename(outputTemp, output); err != nil {
-			log.Debug().Err(err).Msgf("failed to rename %s to %s", outputTemp, output)
+	return util.WithBackgroundIO(func() error {
+		decryptor, err := decrypt.NewDecryptor(s.conf.GetPlatform(), s.conf.GetVersion())
+		if err != nil {
+			return err
 		}
-	}()
 
-	if err := decryptor.Decrypt(context.Background(), dbFile, s.conf.GetDataKey(), outputFile); err != nil {
-		if err == errors.ErrAlreadyDecrypted {
-			if data, err := util.ReadFileShared(dbFile); err == nil {
-				outputFile.Write(data)
-			}
-			if s.conf.GetWalEnabled() {
-				// Remove WAL files if they exist to prevent SQLite from reading encrypted WALs
-				s.removeWalFiles(output)
-			}
-			return nil
+		relPath, err := filepath.Rel(s.conf.GetDataDir(), dbFile)
+		if err != nil {
+			return fmt.Errorf("failed to get relative path for %s: %w", dbFile, err)
 		}
-		log.Err(err).Msgf("failed to decrypt %s", dbFile)
-		return err
-	}
+		output := filepath.Join(s.conf.GetWorkDir(), relPath)
+		if err := util.PrepareDir(filepath.Dir(output)); err != nil {
+			return err
+		}
 
-	log.Debug().Msgf("Decrypted %s to %s", dbFile, output)
+		outputTemp := output + ".tmp"
+		outputFile, err := os.Create(outputTemp)
+		if err != nil {
+			return fmt.Errorf("failed to create output file: %v", err)
+		}
+		defer func() {
+			outputFile.Close()
+			if err := os.Rename(outputTemp, output); err != nil {
+				log.Debug().Err(err).Msgf("failed to rename %s to %s", outputTemp, output)
+			}
+		}()
 
-	if s.conf.GetWalEnabled() {
-		// Remove WAL files if they exist to prevent SQLite from reading encrypted WALs
-		s.removeWalFiles(output)
-	}
+		if err := decryptor.Decrypt(context.Background(), dbFile, s.conf.GetDataKey(), outputFile); err != nil {
+			if err == errors.ErrAlreadyDecrypted {
+				if data, err := util.ReadFileShared(dbFile); err == nil {
+					outputFile.Write(data)
+				}
+				if s.conf.GetWalEnabled() {
+					// Remove WAL files if they exist to prevent SQLite from reading encrypted WALs
+					s.removeWalFiles(output)
+				}
+				return nil
+			}
+			log.Err(err).Msgf("failed to decrypt %s", dbFile)
+			return err
+		}
 
-	return nil
+		log.Debug().Msgf("Decrypted %s to %s", dbFile, output)
+
+		if s.conf.GetWalEnabled() {
+			// Remove WAL files if they exist to prevent SQLite from reading encrypted WALs
+			s.removeWalFiles(output)
+		}
+
+		return nil
+	})
 }
 
 func (s *Service) removeWalFiles(dbFile string) {
@@ -764,7 +800,22 @@ func dbFilePriority(path string) int {
 	return 2
 }
 
+// IncrementalDecryptDBFile 在 work_dir 副本上应用 WAL 增量。
+//
+// 方案 1 集成：与 DecryptDBFile 同样在低 I/O 优先级线程上跑，让位微信。
+// 增量解密本身 IO 量比全量小，但热路径上每次微信写 .db-wal 都可能触发，
+// 累积影响不可忽略。
 func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
+	var handled bool
+	err := util.WithBackgroundIO(func() error {
+		var e error
+		handled, e = s.incrementalDecryptDBFileImpl(dbFile)
+		return e
+	})
+	return handled, err
+}
+
+func (s *Service) incrementalDecryptDBFileImpl(dbFile string) (bool, error) {
 	walPath := dbFile + "-wal"
 	if _, err := os.Stat(walPath); err != nil {
 		if os.IsNotExist(err) {
