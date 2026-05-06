@@ -40,3 +40,9 @@ sns.md
 
 # Local env config (contains keys/paths)
 .env.bat
+
+# HAPI / Claude Code runtime lock files
+.claude/scheduled_tasks.lock
+
+# Local scratch dir for build/test artifacts
+temp/
