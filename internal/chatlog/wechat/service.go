@@ -43,9 +43,12 @@ type Service struct {
 	pendingEvents  map[string]*pendingEvent
 	walStates      map[string]*walState
 	mutex          sync.Mutex
-	fm             *filemonitor.FileMonitor
-	errorHandler   func(error)
-	decryptSem     chan struct{}
+	// poller 是 Step 3 引入的 interval-polling 变化检测器，替代 pkg/filemonitor
+	// 的 fsnotify-based watch（spec §1.2.2 + Eng Review A1：fsnotify watch handle
+	// 与微信对 .db 文件原子操作有内核层干扰，会让用户感知"打开图片卡顿"）。
+	poller       *IntervalPoller
+	errorHandler func(error)
+	decryptSem   chan struct{}
 
 	// ioThrottle 在 acquireDecryptSlot 时让位微信高 IO（方案 4）。
 	// nil 时直接进 sem，无额外延迟（保持改造前行为）。
@@ -362,32 +365,40 @@ func (s *Service) StartAutoDecrypt() error {
 	// When WalEnabled is false, WAL changes still trigger a full re-decrypt of the main .db file.
 	pattern := `.*\.db(-wal|-shm)?$`
 	// rootDir 窄化到 db_storage 子目录：data dir 下 msg/attach/ 有 9.6 万+ 图片文件，
-	// filemonitor 初始化会 fs.WalkDir 整个 rootDir 找匹配 .db 的目录，实测整个 data dir
-	// 要 17 秒；窄化到 db_storage (仅几十个 .db 文件) <2 秒。所有微信 db 都在这里。
+	// 整个 data dir 走一遍 WalkDir 要 17 秒；db_storage (仅几十个 .db) <2 秒。
+	// 所有微信 db 都在这里。
 	dbStorage := filepath.Join(s.conf.GetDataDir(), "db_storage")
-	dbGroup, err := filemonitor.NewFileGroup("wechat", dbStorage, pattern, []string{"fts"})
+	// Step 3：用 IntervalPoller 替代 fsnotify。callback 合成 fsnotify.Event{Op:Write}
+	// 保持 DecryptFileCallback 签名不变（fsnotify 类型在 dbm.go 还有用，将由
+	// Step 5 的 generation_id 轮询机制一起清理掉）。
+	poller, err := NewIntervalPoller(dbStorage, pattern, []string{"fts"}, s.getDecryptPollInterval(), func(path string) error {
+		return s.DecryptFileCallback(fsnotify.Event{Name: path, Op: fsnotify.Write})
+	})
 	if err != nil {
 		return err
 	}
-	dbGroup.AddCallback(s.DecryptFileCallback)
-
-	s.fm = filemonitor.NewFileMonitor()
-	s.fm.AddGroup(dbGroup)
-	if err := s.fm.Start(); err != nil {
-		log.Debug().Err(err).Msg("failed to start file monitor")
+	s.poller = poller
+	if err := s.poller.Start(); err != nil {
+		log.Debug().Err(err).Msg("failed to start interval poller")
 		return err
 	}
 	return nil
 }
 
+// getDecryptPollInterval 返回轮询节奏。当前回退到 DefaultDecryptPollInterval (5min)；
+// 未来 Config 加 GetAutoDecryptPollInterval() 时改这里。
+func (s *Service) getDecryptPollInterval() time.Duration {
+	return DefaultDecryptPollInterval
+}
+
 func (s *Service) StopAutoDecrypt() error {
 	// 1. 停文件监听 —— 不再 spawn 新的 waitAndProcess
-	if s.fm != nil {
-		if err := s.fm.Stop(); err != nil {
+	if s.poller != nil {
+		if err := s.poller.Stop(); err != nil {
 			return err
 		}
 	}
-	s.fm = nil
+	s.poller = nil
 
 	// 2. cancel 后台 goroutine 的 ctx，唤醒 retryOnFileLockCtx 的 backoff sleep
 	s.mutex.Lock()
