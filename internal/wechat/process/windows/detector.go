@@ -16,11 +16,7 @@ const (
 	V4ProcessName = "Weixin"
 	V4DBFile      = `db_storage\session\session.db`
 
-	// ProbeCacheTTL 控制同一 Weixin PID 探测到 DataDir 之后的稳态重探测节流。
-	// 一旦 DataDir 识别出来就在此窗口内复用，不再调 gopsutil p.OpenFiles()。
-	ProbeCacheTTL = 60 * time.Second
-
-	// EmptyInfoProbeCacheTTL 对"尚未探测出 DataDir"的 PID 也做节流。
+	// EmptyInfoProbeCacheTTL 对"尚未探测出 DataDir"的 PID 做节流。
 	// 主进程的 session.db 并非一直被持有（Weixin 4.x 观察到稳态只有
 	// message_fts.db / favorite_*.db-wal 等被保持打开），只盯 session.db
 	// 会把这些主进程当成未登录一直重探。Weixin 还会拉多个 renderer 子进程，
@@ -29,6 +25,11 @@ const (
 	// （gopsutil v4.25.7 OpenFilesWithContext 漏关 OpenProcess 返回的 handle）。
 	// 这里给 30 秒兜底，既抑制泄漏又保留 "用户刚启动 chatlog 后新登录微信"
 	// 的可感知延迟。
+	//
+	// DataDir 一旦识别出来 (非空) 就永久缓存, 不受任何 TTL 影响 ——
+	// PID 进程生命周期内 DataDir 是不变量, 重探只会触发 gopsutil HANDLE 泄漏
+	// 而拿不到任何新信息. 这就是 Step 2 (detector startup-only) 的核心:
+	// OpenFiles 的真实调用频率从 "每秒" 降到 "每个 PID 一生一次".
 	EmptyInfoProbeCacheTTL = 30 * time.Second
 )
 
@@ -97,17 +98,20 @@ func (d *Detector) FindProcesses() ([]*model.Process, error) {
 
 // getOrProbe 对一个 Weixin PID 做探测节流。
 // 命中任一分支就返回缓存、不调 probe：
-//   - DataDir 已识别出来 → 长 TTL（ProbeCacheTTL），因为 DataDir 在进程生命周期内不变；
-//   - DataDir 空 → 短 TTL（EmptyInfoProbeCacheTTL），兜底抑制 gopsutil p.OpenFiles 的 HANDLE 泄漏，
-//     同时保留微信登录后在合理时间内被识别的响应性。
+//   - DataDir 已识别出来 (非空) → 永久缓存 (除非 PID 被 prune)，DataDir 在进程
+//     生命周期内是不变量；
+//   - DataDir 空 → 短 TTL（EmptyInfoProbeCacheTTL），兜底抑制 gopsutil p.OpenFiles
+//     的 HANDLE 泄漏，同时保留微信登录后在合理时间内被识别的响应性。
 func (d *Detector) getOrProbe(pid uint32, probe func() (*model.Process, error)) (*model.Process, error) {
 	d.mu.Lock()
 	if e, ok := d.cache[pid]; ok && e.info != nil {
-		ttl := ProbeCacheTTL
-		if e.info.DataDir == "" {
-			ttl = EmptyInfoProbeCacheTTL
+		// DataDir 已识别 → 永久 cache，绝不重探
+		if e.info.DataDir != "" {
+			d.mu.Unlock()
+			return e.info, nil
 		}
-		if time.Since(e.lastProbed) < ttl {
+		// DataDir 空 → 短 TTL 内复用，超时 reprobe
+		if time.Since(e.lastProbed) < EmptyInfoProbeCacheTTL {
 			d.mu.Unlock()
 			return e.info, nil
 		}

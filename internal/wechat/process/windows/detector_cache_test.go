@@ -71,41 +71,12 @@ func TestGetOrProbe_EmptyDataDirCachedShortTTL(t *testing.T) {
 	}
 }
 
-// TestGetOrProbe_EmptyDataDirTTLShorterThanPopulated 语义保证: 空 DataDir 的
-// TTL 必须严格短于已识别 DataDir 的 TTL，否则微信登录后无法及时被发现。
-func TestGetOrProbe_EmptyDataDirTTLShorterThanPopulated(t *testing.T) {
-	if EmptyInfoProbeCacheTTL >= ProbeCacheTTL {
-		t.Fatalf("EmptyInfoProbeCacheTTL (%v) must be < ProbeCacheTTL (%v) to keep login responsiveness",
-			EmptyInfoProbeCacheTTL, ProbeCacheTTL)
-	}
-}
-
-// TestGetOrProbe_ExpiredTTLReprobes 验证: 缓存过期后重新探测。
-func TestGetOrProbe_ExpiredTTLReprobes(t *testing.T) {
-	d := NewDetector()
-	var probeCount int
-	probe := func() (*model.Process, error) {
-		probeCount++
-		return &model.Process{PID: 7, DataDir: "D:/x"}, nil
-	}
-
-	if _, err := d.getOrProbe(7, probe); err != nil {
-		t.Fatal(err)
-	}
-
-	// 手动把 lastProbed 倒拨到 TTL 之前
-	d.mu.Lock()
-	d.cache[7].lastProbed = time.Now().Add(-ProbeCacheTTL - time.Second)
-	d.mu.Unlock()
-
-	if _, err := d.getOrProbe(7, probe); err != nil {
-		t.Fatal(err)
-	}
-
-	if probeCount != 2 {
-		t.Errorf("expected reprobe after TTL expiry, probeCount=%d want=2", probeCount)
-	}
-}
+// 注: 旧测试 TestGetOrProbe_EmptyDataDirTTLShorterThanPopulated 和
+// TestGetOrProbe_ExpiredTTLReprobes 在 Step 2 后语义不再适用 ——
+// DataDir 非空时永久缓存, 没有 ProbeCacheTTL 概念了. 它们的关切点
+// (空 DataDir 短 TTL / PID 复用重探) 由 detector_startup_only_test.go 里
+// 的 TestGetOrProbe_EmptyDataDirStillRespectsShortTTL 和
+// TestGetOrProbe_PrunedPIDReprobesOnReturn 覆盖.
 
 // TestGetOrProbe_ProbeErrorNotCached 验证: probe 返回错误时不写缓存，下次会重试。
 func TestGetOrProbe_ProbeErrorNotCached(t *testing.T) {
