@@ -38,6 +38,7 @@ var imageAllSuffixes = []string{".dat", "_h.dat", "_t.dat"}
 
 func (s *Service) initRouter() {
 	s.initBaseRouter()
+	s.initHealthRouter()
 	s.initMediaRouter()
 	s.initAPIRouter()
 	s.initBackupRouter()

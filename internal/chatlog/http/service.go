@@ -107,12 +107,36 @@ func NewService(conf Config, db *database.Service) *Service {
 	return s
 }
 
+// HTTP server timeout 防御。Go 标准库默认 0 = 无限，这会导致：
+//   - ReadTimeout 0：客户端建立 TCP 不发请求 → 连接永远挂着 → handle 累积
+//   - WriteTimeout 0：客户端断开但 server 还在写 → goroutine 永远挂起
+//   - IdleTimeout 0：keep-alive 连接闲置 → 占用 handle 不释放
+//
+// 实际故障证据：本机日志 4/21 09:48 有 11 个并发 slow request，elapsed 530s
+// (8.9 分钟), goroutine 编号已经飙到 38 万。timeout 设上后这种半死连接会被
+// 强制断开。
+const (
+	httpReadTimeout  = 30 * time.Second
+	httpWriteTimeout = 60 * time.Second
+	httpIdleTimeout  = 120 * time.Second
+)
+
+// newHTTPServer 构造一个带完整 timeout 的 *http.Server。
+// 抽出来是为了让 Start / ListenAndServe 共用同一份配置，
+// 同时方便单元测试验证 timeout 是否真的设上去了。
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  httpReadTimeout,
+		WriteTimeout: httpWriteTimeout,
+		IdleTimeout:  httpIdleTimeout,
+	}
+}
+
 func (s *Service) Start() error {
 
-	s.server = &http.Server{
-		Addr:    s.conf.GetHTTPAddr(),
-		Handler: s.router,
-	}
+	s.server = newHTTPServer(s.conf.GetHTTPAddr(), s.router)
 
 	go func() {
 		// Handle error from Run
@@ -128,10 +152,7 @@ func (s *Service) Start() error {
 
 func (s *Service) ListenAndServe() error {
 
-	s.server = &http.Server{
-		Addr:    s.conf.GetHTTPAddr(),
-		Handler: s.router,
-	}
+	s.server = newHTTPServer(s.conf.GetHTTPAddr(), s.router)
 
 	log.Info().Msg("Starting HTTP server on " + s.conf.GetHTTPAddr())
 	return s.server.ListenAndServe()
