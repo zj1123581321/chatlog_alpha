@@ -186,6 +186,29 @@ func (d *DBManager) Close() error {
 	return d.fm.Stop()
 }
 
+// InvalidateAll 关掉所有缓存的 sql.DB 连接 + 清 dbs/dbPaths 两张 map。
+//
+// Step 5 generation 切换的服务端 hook（spec Eng Review Lock A3）：watcher 完成
+// atomic swap 后，server 进程 30s 内 polling status.json 检出 current_generation
+// 变化，调用本方法。下一次 GetDB / OpenDB 会按新 generation 路径 sql.Open，
+// 池中的连接不会再指向旧 generation 的物理文件。
+//
+// 关闭走 goroutine 异步：在途 query 还在用 fd 时同步 Close 会阻塞 invalidate 线程；
+// 异步释放让本调用立刻返回，pool 切换不被慢查询拖住。
+func (d *DBManager) InvalidateAll() {
+	d.mutex.Lock()
+	dbs := d.dbs
+	d.dbs = make(map[string]*sql.DB)
+	d.dbPaths = make(map[string][]string)
+	d.mutex.Unlock()
+
+	for _, db := range dbs {
+		go func(db *sql.DB) {
+			_ = db.Close()
+		}(db)
+	}
+}
+
 func normalizeDBPath(path string) string {
 	if strings.HasSuffix(path, "-wal") || strings.HasSuffix(path, "-shm") {
 		return strings.TrimSuffix(strings.TrimSuffix(path, "-wal"), "-shm")
