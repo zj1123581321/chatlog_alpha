@@ -663,6 +663,65 @@ func (s *Service) DecryptDBFile(dbFile string) error {
 	})
 }
 
+// DecryptDBFileExplicit 把 srcDB 解密到 dstDB（与 DecryptDBFile 不同：不基于
+// data_dir/work_dir 推算路径，而是 caller 提供完整 src/dst）。
+//
+// Step 7 generation pipeline 的解密钩子：
+//   raw_dir/db_storage/<rel>  → decrypted_dir/db_storage/<rel>
+// 让 RunGenerationCycle 不需要触碰 Service 的 work_dir 状态，自然落到 generation
+// 不可变快照里。
+//
+// 逻辑与 DecryptDBFile 平行 —— 走相同的 ErrAlreadyDecrypted、WAL clean、tmp+rename
+// 路径，只把"output 路径如何确定"这一处替换成参数。两者刻意没合并 helper：
+// DecryptDBFile 是热路径有大量调用方，重构会牵动 Step 5/6 风险面，独立加新方法
+// 比抽公共代码更稳。
+func (s *Service) DecryptDBFileExplicit(srcDB, dstDB string) error {
+	return util.WithBackgroundIO(func() error {
+		decryptor, err := decrypt.NewDecryptor(s.conf.GetPlatform(), s.conf.GetVersion())
+		if err != nil {
+			return err
+		}
+
+		if err := util.PrepareDir(filepath.Dir(dstDB)); err != nil {
+			return err
+		}
+
+		outputTemp := dstDB + ".tmp"
+		outputFile, err := os.Create(outputTemp)
+		if err != nil {
+			return fmt.Errorf("failed to create output file: %v", err)
+		}
+		defer func() {
+			outputFile.Close()
+			if err := os.Rename(outputTemp, dstDB); err != nil {
+				log.Debug().Err(err).Msgf("failed to rename %s to %s", outputTemp, dstDB)
+			}
+		}()
+
+		if err := decryptor.Decrypt(context.Background(), srcDB, s.conf.GetDataKey(), outputFile); err != nil {
+			if err == errors.ErrAlreadyDecrypted {
+				if data, err := util.ReadFileShared(srcDB); err == nil {
+					outputFile.Write(data)
+				}
+				if s.conf.GetWalEnabled() {
+					s.removeWalFiles(dstDB)
+				}
+				return nil
+			}
+			log.Err(err).Msgf("failed to decrypt %s", srcDB)
+			return err
+		}
+
+		log.Debug().Msgf("Decrypted %s to %s", srcDB, dstDB)
+
+		if s.conf.GetWalEnabled() {
+			s.removeWalFiles(dstDB)
+		}
+
+		return nil
+	})
+}
+
 func (s *Service) removeWalFiles(dbFile string) {
 	walFile := dbFile + "-wal"
 	shmFile := dbFile + "-shm"
